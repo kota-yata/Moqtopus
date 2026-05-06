@@ -1,0 +1,7 @@
+{
+  "name": "mosque",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "msquic"
+  ]
+}
