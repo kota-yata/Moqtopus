@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(mosque LANGUAGES CXX)
+project(montique LANGUAGES CXX)
 
 find_package(msquic CONFIG REQUIRED)
 
-add_executable(mosque src/main.cpp)
-target_compile_features(mosque PRIVATE cxx_std_17)
-target_link_libraries(mosque PRIVATE msquic)
+add_executable(montique src/main.cpp)
+target_compile_features(montique PRIVATE cxx_std_17)
+target_link_libraries(montique PRIVATE msquic)

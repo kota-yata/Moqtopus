@@ -1,4 +1,4 @@
-# mosque
+# Montique
 MoQ Publisher/Subscriber API over MsQUIC library
 
 ## Build
