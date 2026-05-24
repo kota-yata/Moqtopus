@@ -1,0 +1,102 @@
+#pragma once
+
+#include "moq/codec.h"
+#include "moq/types.h"
+#include "moq/object_handler.h"
+#include "msquic_transport_adapter.h"
+#include "data_plane.h"
+#include "moq/errors.h"
+
+#include <deque>
+#include <memory>
+#include <optional>
+#include <string>
+#include <functional>
+#include <future>
+
+namespace moq::detail {
+
+// Lightweight FSM for a single request stream (SUBSCRIBE / FETCH / ...).
+// This class is a reorganization target: it encapsulates per-request state
+// and provides callbacks for the owning Session to integrate with.
+class SubscriptionFSM {
+public:
+    enum class Phase { Pending, Established, UpdateFailed, Terminated };
+
+    struct PendingUpdate {
+        RequestId request_id = 0;
+        std::shared_ptr<std::promise<RequestOk>> promise;
+    };
+
+    using InstallRouteCb = std::function<bool(TrackAlias, std::shared_ptr<ReceiveRoute>)>;
+    using DeactivateRouteCb = std::function<void(TrackAlias)>;
+    using RemoveRouteCb = std::function<void(TrackAlias)>;
+    using SubscribeResultCb = std::function<void(std::optional<RequestError> rejected, std::optional<TrackAlias> alias)>;
+
+    SubscriptionFSM(RequestId request_id,
+                    SubscribeRequest request,
+                    std::shared_ptr<ObjectHandler> handler,
+                    std::shared_ptr<TransportStream> stream,
+                    InstallRouteCb install_cb,
+                    DeactivateRouteCb deactivate_cb,
+                    RemoveRouteCb remove_cb,
+                    SubscribeResultCb subscribe_result_cb);
+
+    ~SubscriptionFSM();
+
+    // Feed raw bytes from the peer into this request stream.
+    void on_bytes(ByteBuffer bytes, bool fin);
+
+    // Called when the peer aborts sending on this stream.
+    void on_peer_send_aborted(uint64_t error_code);
+
+    // Called when the stream is shutdown by the peer.
+    void on_shutdown();
+
+    // Enqueue a request-update to be sent on this stream. Returns the generated id.
+    RequestId send_request_update(RequestId allocated_request_id,
+                                  RequestUpdate update,
+                                  std::shared_ptr<std::promise<RequestOk>> promise,
+                                  std::function<bool(ByteBuffer)> sender);
+
+    // Stop the subscription and optionally report error to handler.
+    void terminate(bool report_error, std::string reason);
+
+    Phase phase() const { return phase_; }
+    RequestId request_id() const { return request_id_; }
+
+private:
+    void handle_control_message(const codec::ControlMessage& message);
+    void accept_subscribe_ok(const codec::ControlMessage& message);
+    void reject_initial_subscribe(const codec::ControlMessage& message);
+    void accept_request_ok(const codec::ControlMessage& message);
+    void reject_request_update(const codec::ControlMessage& message);
+    void accept_publish_done(const codec::ControlMessage& message);
+
+    RequestId request_id_;
+    SubscribeRequest request_;
+    Phase phase_ = Phase::Pending;
+    std::optional<TrackAlias> track_alias_;
+    std::shared_ptr<TransportStream> stream_;
+    ByteBuffer response_buffer_;
+    std::shared_ptr<ObjectHandler> handler_;
+    std::shared_ptr<ReceiveRoute> route_;
+    bool subscribe_settled_ = false;
+    std::deque<PendingUpdate> updates_;
+
+    InstallRouteCb install_route_cb_;
+    DeactivateRouteCb deactivate_route_cb_;
+    RemoveRouteCb remove_route_cb_;
+    SubscribeResultCb subscribe_result_cb_;
+
+public:
+    std::shared_ptr<TransportStream> stream() const { return stream_; }
+    std::optional<TrackAlias> track_alias() const { return track_alias_; }
+    size_t inflight_updates() const { return updates_.size(); }
+    // Allow owner to ask FSM to report an error to the handler.
+    void report_handler_error(const ReceiveError& err) {
+        if (handler_) handler_->on_error(err);
+    }
+};
+
+} // namespace moq::detail

@@ -4,6 +4,7 @@
 #include "moq/codec.h"
 #include "msquic_transport_adapter.h"
 #include "peer_stream_demux.h"
+#include "request/subscription.h"
 
 #include <algorithm>
 #include <deque>
@@ -205,24 +206,7 @@ public:
     }
 
 private:
-    struct PendingUpdate {
-        RequestId request_id = 0;
-        std::shared_ptr<std::promise<RequestOk>> promise;
-    };
-
-    struct Subscription {
-        RequestId request_id = 0;
-        SubscribeRequest request;
-        SubscriptionPhase phase = SubscriptionPhase::Pending;
-        std::optional<TrackAlias> track_alias;
-        std::shared_ptr<TransportStream> stream;
-        ByteBuffer response_buffer;
-        std::shared_ptr<ObjectHandler> handler;
-        std::shared_ptr<ReceiveRoute> route;
-        std::shared_ptr<std::promise<SubscriptionHandle>> subscribe_promise;
-        bool subscribe_settled = false;
-        std::deque<PendingUpdate> updates;
-    };
+    // per-request FSMs live in SubscriptionFSM
 
     // Send SETUP on connection establishment
     void on_connected() {
@@ -361,6 +345,7 @@ private:
         }
     }
 
+    // handles session-level control messages
     void handle_peer_control_message(const codec::ControlMessage& message) {
         if (!peer_setup_received_) {
             if (message.type != codec::kMessageSetup) {
@@ -440,34 +425,71 @@ private:
             } else {
                 request_id = allocate_request_id();
             }
-            auto subscription = std::make_shared<Subscription>();
-            subscription->request_id = request_id;
-            subscription->request = request;
-            subscription->handler = std::move(handler);
-            subscription->subscribe_promise = promise;
-            subscription->stream = transport_->open_stream(false);
+            auto stream = transport_->open_stream(false);
             const std::weak_ptr<SessionImpl> weak = weak_from_this();
-            subscription->stream->on_bytes(
-                [weak, request_id](ByteBuffer bytes, bool fin) mutable {
-                    if (auto active = weak.lock()) {
-                        active->on_subscription_bytes(request_id, std::move(bytes), fin);
-                    }
-                });
-            subscription->stream->on_peer_send_aborted(
-                [weak, request_id](uint64_t error_code) {
-                    if (auto active = weak.lock()) {
-                        active->subscription_aborted(request_id, error_code);
-                    }
-                });
-            subscription->stream->on_shutdown([weak, request_id] {
+
+            // install route callback: if duplicate alias detected, close session
+            auto install_cb = [weak](TrackAlias alias, std::shared_ptr<ReceiveRoute> route) {
                 if (auto active = weak.lock()) {
-                    active->subscription_shutdown(request_id);
+                    if (!active->data_plane_.install_route(alias, route)) {
+                        active->begin_close(
+                            static_cast<uint64_t>(SessionCloseErrorCode::DuplicateTrackAlias),
+                            "SUBSCRIBE_OK reused an established Track Alias");
+                        return false;
+                    }
+                    return true;
                 }
+                return false;
+            };
+
+            auto deactivate_cb = [weak](TrackAlias alias) {
+                if (auto active = weak.lock()) {
+                    active->data_plane_.deactivate_route(alias);
+                }
+            };
+
+            auto remove_cb = [weak](TrackAlias alias) {
+                if (auto active = weak.lock()) {
+                    active->data_plane_.remove_route(alias);
+                }
+            };
+
+            // subscribe result callback: settle promise and refresh snapshots
+            auto subscribe_result_cb = [weak, promise, request_id](std::optional<RequestError> rejected,
+                                                                     std::optional<TrackAlias> alias) {
+                if (auto active = weak.lock()) {
+                    if (rejected) {
+                        set_exception(promise, rejected_exception(*rejected));
+                    } else {
+                        try {
+                            promise->set_value(SubscriptionHandle(request_id, weak));
+                        } catch (...) {
+                            set_exception(promise, std::current_exception());
+                        }
+                    }
+                    active->refresh_session_snapshot();
+                    active->update_subscription_snapshot_from_fsm(request_id);
+                }
+            };
+
+            auto fsm = std::make_shared<SubscriptionFSM>(
+                request_id, std::move(request), std::move(handler), stream,
+                std::move(install_cb), std::move(deactivate_cb), std::move(remove_cb),
+                std::move(subscribe_result_cb));
+
+            // wire transport stream callbacks into FSM
+            stream->on_bytes([fsm](ByteBuffer bytes, bool fin) mutable {
+                fsm->on_bytes(std::move(bytes), fin);
             });
-            subscriptions_.emplace(request_id, subscription);
-            update_subscription_snapshot(*subscription);
+            stream->on_peer_send_aborted([fsm](uint64_t error_code) mutable {
+                fsm->on_peer_send_aborted(error_code);
+            });
+            stream->on_shutdown([fsm] { fsm->on_shutdown(); });
+
+            subscriptions_.emplace(request_id, fsm);
+            update_subscription_snapshot_from_fsm(request_id);
             refresh_session_snapshot();
-            if (!subscription->stream->send(codec::encode_subscribe(request_id, request))) {
+            if (!stream->send(codec::encode_subscribe(request_id, request))) {
                 throw std::runtime_error("StreamSend failed for SUBSCRIBE");
             }
         } catch (...) {
@@ -481,21 +503,17 @@ private:
         std::shared_ptr<std::promise<RequestOk>> promise) {
         const auto found = subscriptions_.find(existing_request_id);
         if (found == subscriptions_.end() ||
-            found->second->phase != SubscriptionPhase::Established) {
+            found->second->phase() != SubscriptionFSM::Phase::Established) {
             set_exception(promise, "REQUEST_UPDATE requires an established subscription");
             return;
         }
-        std::shared_ptr<Subscription> subscription = found->second;
+        auto fsm = found->second;
         try {
-            PendingUpdate pending;
-            pending.request_id = allocate_request_id();
-            pending.promise = promise;
-            if (!subscription->stream->send(
-                    codec::encode_request_update(pending.request_id, update))) {
-                throw std::runtime_error("StreamSend failed for REQUEST_UPDATE");
-            }
-            subscription->updates.push_back(std::move(pending));
-            update_subscription_snapshot(*subscription);
+            RequestId request_id = allocate_request_id();
+            auto stream = fsm->stream();
+            auto sender = [stream](ByteBuffer bytes) { return stream->send(std::move(bytes)); };
+            fsm->send_request_update(request_id, std::move(update), promise, sender);
+            update_subscription_snapshot_from_fsm(existing_request_id);
         } catch (...) {
             set_exception(promise, std::current_exception());
         }
@@ -503,263 +521,63 @@ private:
 
     void on_subscription_bytes(RequestId request_id, ByteBuffer bytes, bool fin) {
         const auto found = subscriptions_.find(request_id);
-        if (found == subscriptions_.end()) {
-            return;
-        }
-        const std::shared_ptr<Subscription> subscription = found->second;
-        subscription->response_buffer.insert(
-            subscription->response_buffer.end(), bytes.begin(), bytes.end());
-        for (;;) {
-            const codec::ControlMessageResult parsed =
-                codec::read_control_message(subscription->response_buffer);
-            if (parsed.status != codec::DecodeStatus::Done) {
-                break;
-            }
-            subscription->response_buffer.erase(
-                subscription->response_buffer.begin(),
-                subscription->response_buffer.begin() +
-                    static_cast<std::ptrdiff_t>(parsed.bytes));
-            handle_subscription_message(subscription, parsed.message);
-            if (phase_ == SessionPhase::Closing || phase_ == SessionPhase::Closed) {
-                return;
-            }
-        }
-        if (!fin) {
-            return;
-        }
-        if (!subscription->response_buffer.empty()) {
-            protocol_violation("request stream ended mid-message");
-            return;
-        }
-        if (subscription->phase != SubscriptionPhase::Terminated) {
-            terminate_subscription(
-                subscription, true, "publisher closed request stream");
+        if (found == subscriptions_.end()) return;
+        auto fsm = found->second;
+        fsm->on_bytes(std::move(bytes), fin);
+        if (fin && fsm->phase() == SubscriptionFSM::Phase::Terminated) {
+            update_subscription_snapshot_from_fsm(request_id);
+            refresh_session_snapshot();
+            // keep entry until owner removes it explicitly
         }
     }
 
-    void handle_subscription_message(
-        const std::shared_ptr<Subscription>& subscription,
-        const codec::ControlMessage& message) {
-        if (subscription->phase == SubscriptionPhase::Pending) {
-            if (message.type == codec::kMessageSubscribeOk) {
-                accept_subscribe_ok(subscription, message.payload);
-                return;
-            }
-            if (message.type == codec::kMessageRequestError) {
-                reject_initial_subscribe(subscription, message.payload);
-                return;
-            }
-            protocol_violation("invalid first response on SUBSCRIBE stream");
-            return;
-        }
 
-        if (subscription->phase == SubscriptionPhase::Terminated) {
-            return;
-        }
-        if (message.type == codec::kMessageRequestOk) {
-            accept_request_ok(subscription, message.payload);
-            return;
-        }
-        if (message.type == codec::kMessageRequestError) {
-            reject_request_update(subscription, message.payload);
-            return;
-        }
-        if (message.type == codec::kMessagePublishDone) {
-            accept_publish_done(subscription, message.payload);
-            return;
-        }
-        if (message.type == codec::kMessageGoAway) {
-            return;
-        }
-        protocol_violation(
-            "invalid response on SUBSCRIBE stream: " + std::to_string(message.type));
-    }
-
-    void accept_subscribe_ok(
-        const std::shared_ptr<Subscription>& subscription,
-        const ByteBuffer& payload) {
-        std::string error;
-        const std::optional<codec::SubscribeOk> ok =
-            codec::decode_subscribe_ok(payload, error);
-        if (!ok) {
-            protocol_violation(std::move(error));
-            return;
-        }
-        auto route = std::make_shared<ReceiveRoute>();
-        route->request_id = subscription->request_id;
-        route->track_alias = ok->track_alias;
-        route->handler = subscription->handler;
-        if (!data_plane_.install_route(ok->track_alias, route)) {
-            begin_close(
-                static_cast<uint64_t>(SessionCloseErrorCode::DuplicateTrackAlias),
-                "SUBSCRIBE_OK reused an established Track Alias");
-            return;
-        }
-        subscription->track_alias = ok->track_alias;
-        subscription->route = std::move(route);
-        subscription->phase = SubscriptionPhase::Established;
-        if (!subscription->subscribe_settled) {
-            subscription->subscribe_promise->set_value(
-                SubscriptionHandle(subscription->request_id, weak_from_this()));
-            subscription->subscribe_settled = true;
-        }
-        update_subscription_snapshot(*subscription);
-        refresh_session_snapshot();
-    }
-
-    void reject_initial_subscribe(
-        const std::shared_ptr<Subscription>& subscription,
-        const ByteBuffer& payload) {
-        std::string error;
-        const std::optional<RequestError> rejected =
-            codec::decode_request_error(payload, error);
-        if (!rejected) {
-            protocol_violation(std::move(error));
-            return;
-        }
-        if (!subscription->subscribe_settled) {
-            set_exception(subscription->subscribe_promise, rejected_exception(*rejected));
-            subscription->subscribe_settled = true;
-        }
-        terminate_subscription(subscription, false, {});
-    }
-
-    void accept_request_ok(
-        const std::shared_ptr<Subscription>& subscription,
-        const ByteBuffer& payload) {
-        if (subscription->updates.empty()) {
-            protocol_violation("REQUEST_OK arrived without an in-flight REQUEST_UPDATE");
-            return;
-        }
-        std::string error;
-        const std::optional<RequestOk> ok = codec::decode_request_ok(payload, error);
-        if (!ok) {
-            protocol_violation(std::move(error));
-            return;
-        }
-        if (!ok->track_properties.empty()) {
-            protocol_violation("REQUEST_UPDATE_OK included Track Properties");
-            return;
-        }
-        PendingUpdate pending = std::move(subscription->updates.front());
-        subscription->updates.pop_front();
-        pending.promise->set_value(*ok);
-        update_subscription_snapshot(*subscription);
-    }
-
-    void reject_request_update(
-        const std::shared_ptr<Subscription>& subscription,
-        const ByteBuffer& payload) {
-        if (subscription->updates.empty()) {
-            protocol_violation("REQUEST_ERROR arrived without an in-flight request");
-            return;
-        }
-        std::string error;
-        const std::optional<RequestError> rejected =
-            codec::decode_request_error(payload, error);
-        if (!rejected) {
-            protocol_violation(std::move(error));
-            return;
-        }
-        const std::exception_ptr exception = rejected_exception(*rejected);
-        while (!subscription->updates.empty()) {
-            PendingUpdate pending = std::move(subscription->updates.front());
-            subscription->updates.pop_front();
-            set_exception(pending.promise, exception);
-        }
-        subscription->phase = SubscriptionPhase::UpdateFailed;
-        update_subscription_snapshot(*subscription);
-    }
-
-    void accept_publish_done(
-        const std::shared_ptr<Subscription>& subscription,
-        const ByteBuffer& payload) {
-        std::string error;
-        const std::optional<PublishDone> done =
-            codec::decode_publish_done(payload, error);
-        if (!done) {
-            protocol_violation(std::move(error));
-            return;
-        }
-        if (subscription->route) {
-            subscription->route->expected_stream_count.store(done->stream_count);
-        }
-        subscription->handler->on_publish_done(*done);
-        terminate_subscription(subscription, false, {});
-    }
 
     void subscription_aborted(RequestId request_id, uint64_t error_code) {
         const auto found = subscriptions_.find(request_id);
-        if (found == subscriptions_.end()) {
-            return;
+        if (found == subscriptions_.end()) return;
+        auto fsm = found->second;
+        fsm->on_peer_send_aborted(error_code);
+        if (fsm->phase() == SubscriptionFSM::Phase::Terminated) {
+            update_subscription_snapshot_from_fsm(request_id);
+            refresh_session_snapshot();
         }
-        terminate_subscription(
-            found->second,
-            true,
-            "publisher reset request stream with error " + std::to_string(error_code));
     }
 
     void subscription_shutdown(RequestId request_id) {
         const auto found = subscriptions_.find(request_id);
-        if (found == subscriptions_.end() ||
-            found->second->phase == SubscriptionPhase::Terminated) {
-            return;
+        if (found == subscriptions_.end()) return;
+        auto fsm = found->second;
+        fsm->on_shutdown();
+        if (fsm->phase() == SubscriptionFSM::Phase::Terminated) {
+            update_subscription_snapshot_from_fsm(request_id);
+            refresh_session_snapshot();
         }
-        terminate_subscription(
-            found->second, true, "request stream shut down before subscription ended");
     }
 
     void stop_subscription_on_executor(RequestId request_id, bool report_error) {
         const auto found = subscriptions_.find(request_id);
-        if (found == subscriptions_.end()) {
-            return;
-        }
-        terminate_subscription(
-            found->second,
-            report_error,
-            report_error ? "subscription stopped after receive error" : std::string{});
-        found->second->stream->abort_receive(0);
+        if (found == subscriptions_.end()) return;
+        auto fsm = found->second;
+        fsm->terminate(report_error, report_error ? "subscription stopped after receive error" : std::string{});
+        if (auto s = fsm->stream()) s->abort_receive(0);
+        update_subscription_snapshot_from_fsm(request_id);
+        refresh_session_snapshot();
+        subscriptions_.erase(found);
     }
 
-    void terminate_subscription(
-        const std::shared_ptr<Subscription>& subscription,
-        bool report_error,
-        std::string reason) {
-        if (subscription->phase == SubscriptionPhase::Terminated) {
-            return;
-        }
-        if (!subscription->subscribe_settled) {
-            set_exception(
-                subscription->subscribe_promise,
-                reason.empty() ? "subscription terminated before SUBSCRIBE_OK" : reason);
-            subscription->subscribe_settled = true;
-        }
-        while (!subscription->updates.empty()) {
-            PendingUpdate pending = std::move(subscription->updates.front());
-            subscription->updates.pop_front();
-            set_exception(
-                pending.promise,
-                reason.empty() ? "subscription terminated before REQUEST_UPDATE completed"
-                               : reason);
-        }
-        if (subscription->track_alias) {
-            data_plane_.deactivate_route(*subscription->track_alias);
-            data_plane_.remove_route(*subscription->track_alias);
-        }
-        subscription->phase = SubscriptionPhase::Terminated;
-        if (report_error && !reason.empty()) {
-            subscription->handler->on_error(ReceiveError{0, std::move(reason)});
-        }
-        update_subscription_snapshot(*subscription);
-        refresh_session_snapshot();
+    void terminate_subscription(const std::shared_ptr<SubscriptionFSM>& fsm,
+                                bool report_error,
+                                std::string reason) {
+        // Not used; kept for compatibility. Prefer stop_subscription_on_executor.
+        (void)fsm; (void)report_error; (void)reason;
     }
 
     void malformed_track(RequestId request_id, std::string error) {
         const auto found = subscriptions_.find(request_id);
-        if (found == subscriptions_.end()) {
-            return;
-        }
-        found->second->handler->on_error(ReceiveError{0x12, error});
+        if (found == subscriptions_.end()) return;
+        auto fsm = found->second;
+        fsm->report_handler_error(ReceiveError{0x12, error});
         stop_subscription_on_executor(request_id, false);
     }
 
@@ -783,7 +601,7 @@ private:
         close_reason_ = SessionCloseReason{code, reason};
         fail_ready_waiters(reason.empty() ? "MOQT session closing" : reason);
         for (auto& entry : subscriptions_) {
-            terminate_subscription(entry.second, true, reason);
+            if (entry.second) entry.second->terminate(true, reason);
         }
         refresh_session_snapshot();
         if (transport_) {
@@ -809,14 +627,32 @@ private:
         ready_waiters_.clear();
     }
 
-    void update_subscription_snapshot(const Subscription& subscription) {
+    // (old Subscription-based snapshot helper removed)
+
+    void update_subscription_snapshot_from_fsm(RequestId request_id) {
         std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        const auto it = subscriptions_.find(request_id);
+        if (it == subscriptions_.end()) return;
         SubscriptionStateSnapshot snapshot;
-        snapshot.phase = subscription.phase;
-        snapshot.request_id = subscription.request_id;
-        snapshot.track_alias = subscription.track_alias;
-        snapshot.inflight_updates = subscription.updates.size();
-        subscription_snapshots_[subscription.request_id] = snapshot;
+        snapshot.request_id = request_id;
+        const auto& fsm = it->second;
+        switch (fsm->phase()) {
+        case SubscriptionFSM::Phase::Pending:
+            snapshot.phase = SubscriptionPhase::Pending;
+            break;
+        case SubscriptionFSM::Phase::Established:
+            snapshot.phase = SubscriptionPhase::Established;
+            break;
+        case SubscriptionFSM::Phase::UpdateFailed:
+            snapshot.phase = SubscriptionPhase::UpdateFailed;
+            break;
+        case SubscriptionFSM::Phase::Terminated:
+            snapshot.phase = SubscriptionPhase::Terminated;
+            break;
+        }
+        snapshot.track_alias = fsm->track_alias();
+        snapshot.inflight_updates = fsm->inflight_updates();
+        subscription_snapshots_[request_id] = snapshot;
     }
 
     void refresh_session_snapshot() {
@@ -830,8 +666,9 @@ private:
                 ? std::optional<std::string>(msquic_config_.alpn)
                 : std::nullopt;
         size_t active = 0;
-        for (const auto& subscription : subscriptions_) {
-            if (subscription.second->phase != SubscriptionPhase::Terminated) {
+        for (const auto& entry : subscriptions_) {
+            const auto& fsm = entry.second;
+            if (fsm && fsm->phase() != SubscriptionFSM::Phase::Terminated) {
                 ++active;
             }
         }
@@ -853,7 +690,7 @@ private:
     std::shared_ptr<TransportStream> local_setup_stream_;
     ByteBuffer peer_control_buffer_;
     std::vector<std::shared_ptr<std::promise<void>>> ready_waiters_;
-    std::unordered_map<RequestId, std::shared_ptr<Subscription>> subscriptions_;
+    std::unordered_map<RequestId, std::shared_ptr<SubscriptionFSM>> subscriptions_;
 
     mutable std::mutex snapshot_mutex_;
     SessionStateSnapshot session_snapshot_;
