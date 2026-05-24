@@ -16,9 +16,7 @@
 
 namespace moq::detail {
 
-// Lightweight FSM for a single request stream (SUBSCRIBE / FETCH / ...).
-// This class is a reorganization target: it encapsulates per-request state
-// and provides callbacks for the owning Session to integrate with.
+// FSM for a single request stream (SUBSCRIBE / FETCH / ...).
 class SubscriptionFSM {
 public:
     enum class Phase { Pending, Established, UpdateFailed, Terminated };

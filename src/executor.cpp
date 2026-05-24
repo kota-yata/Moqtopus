@@ -12,6 +12,7 @@ struct Executor::State {
     std::thread::id thread_id;
 };
 
+// Executor spawns a thread that runs tasks in state->tasks sequentially
 Executor::Executor()
     : state_(std::make_shared<State>()),
       thread_([state = state_] { run(std::move(state)); }) {}
