@@ -44,7 +44,7 @@ void set_exception(
     }
 }
 
-// converts REQUEST_ERROR to future-gettable exception
+// converts REQUEST_ERROR to c++ exception
 std::exception_ptr rejected_exception(const RequestError& error) {
     return std::make_exception_ptr(RequestRejected(error.code, error.retry_interval, error.reason));
 }
@@ -73,7 +73,6 @@ bool known_peer_request_type(uint64_t type) {
 
 } // namespace
 
-// Session plane
 class SessionImpl : public std::enable_shared_from_this<SessionImpl> {
 public:
     SessionImpl(MsQuicClientConfig msquic_config, SubscriberConfig subscriber_config)
@@ -111,6 +110,7 @@ public:
         transport_->start();
     }
 
+    // waits until session is either ready or closed
     std::future<void> ready() {
         auto promise = std::make_shared<std::promise<void>>();
         std::future<void> future = promise->get_future();

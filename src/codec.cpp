@@ -1,11 +1,12 @@
 #include "moq/codec.h"
 
+#include "codec/internal.h"
 #include "moq/errors.h"
 
 #include <algorithm>
 #include <array>
 #include <limits>
-#include <sstream>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -72,60 +73,6 @@ const std::string& RequestRejected::reason() const noexcept {
 namespace moq::codec {
 namespace {
 
-enum class ParameterEncoding {
-    Uint8,
-    Varint,
-    Location,
-    LengthPrefixed,
-    TrackNamespace,
-};
-
-struct Cursor {
-    const ByteBuffer& bytes;
-    size_t offset = 0;
-
-    bool read_byte(uint8_t& value) {
-        if (offset >= bytes.size()) {
-            return false;
-        }
-        value = bytes[offset++];
-        return true;
-    }
-
-    bool read_varint(uint64_t& value) {
-        const VarintResult parsed = codec::read_varint(bytes, offset);
-        if (parsed.status != DecodeStatus::Done) {
-            return false;
-        }
-        offset += parsed.bytes;
-        value = parsed.value;
-        return true;
-    }
-
-    bool read_bytes(size_t size, ByteBuffer& value) {
-        if (size > bytes.size() - offset) {
-            return false;
-        }
-        value.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
-                     bytes.begin() + static_cast<std::ptrdiff_t>(offset + size));
-        offset += size;
-        return true;
-    }
-
-    bool read_string(size_t size, std::string& value) {
-        if (size > bytes.size() - offset) {
-            return false;
-        }
-        value.assign(reinterpret_cast<const char*>(bytes.data() + offset), size);
-        offset += size;
-        return true;
-    }
-
-    size_t remaining() const {
-        return bytes.size() - offset;
-    }
-};
-
 size_t varint_length(uint64_t value) {
     static constexpr std::array<uint64_t, 8> kMax = {
         0x7fULL,
@@ -159,6 +106,24 @@ uint8_t varint_prefix(size_t length) {
     return static_cast<uint8_t>(0xff << (9 - length));
 }
 
+void append_u16(ByteBuffer& out, uint16_t value) {
+    out.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+    out.push_back(static_cast<uint8_t>(value & 0xff));
+}
+
+} // namespace
+
+namespace internal {
+namespace {
+
+enum class ParameterEncoding {
+    Uint8,
+    Varint,
+    Location,
+    LengthPrefixed,
+    TrackNamespace,
+};
+
 std::optional<ParameterEncoding> parameter_encoding(uint64_t type) {
     switch (type) {
     case 0x02:
@@ -184,13 +149,51 @@ std::optional<ParameterEncoding> parameter_encoding(uint64_t type) {
     }
 }
 
+} // namespace
+
 void append_bytes(ByteBuffer& out, const std::string& value) {
     out.insert(out.end(), value.begin(), value.end());
 }
 
-void append_u16(ByteBuffer& out, uint16_t value) {
-    out.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
-    out.push_back(static_cast<uint8_t>(value & 0xff));
+bool Cursor::read_byte(uint8_t& value) {
+    if (offset >= bytes.size()) {
+        return false;
+    }
+    value = bytes[offset++];
+    return true;
+}
+
+bool Cursor::read_varint(uint64_t& value) {
+    const VarintResult parsed = codec::read_varint(bytes, offset);
+    if (parsed.status != DecodeStatus::Done) {
+        return false;
+    }
+    offset += parsed.bytes;
+    value = parsed.value;
+    return true;
+}
+
+bool Cursor::read_bytes(size_t size, ByteBuffer& value) {
+    if (size > bytes.size() - offset) {
+        return false;
+    }
+    value.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                 bytes.begin() + static_cast<std::ptrdiff_t>(offset + size));
+    offset += size;
+    return true;
+}
+
+bool Cursor::read_string(size_t size, std::string& value) {
+    if (size > bytes.size() - offset) {
+        return false;
+    }
+    value.assign(reinterpret_cast<const char*>(bytes.data() + offset), size);
+    offset += size;
+    return true;
+}
+
+size_t Cursor::remaining() const {
+    return bytes.size() - offset;
 }
 
 bool read_reason(Cursor& cursor, std::string& reason) {
@@ -201,7 +204,7 @@ bool read_reason(Cursor& cursor, std::string& reason) {
     return cursor.read_string(static_cast<size_t>(size), reason);
 }
 
-bool read_track_namespace(Cursor& cursor, TrackNamespace* result = nullptr) {
+bool read_track_namespace(Cursor& cursor, TrackNamespace* result) {
     uint64_t fields = 0;
     if (!cursor.read_varint(fields) || fields > 32) {
         return false;
@@ -372,7 +375,7 @@ void append_setup_option_bytes(
     append_bytes(payload, value);
 }
 
-} // namespace
+} // namespace internal
 
 void write_varint(ByteBuffer& out, uint64_t value) {
     const size_t length = varint_length(value);
@@ -469,150 +472,9 @@ void write_track_namespace(ByteBuffer& out, const TrackNamespace& name_space) {
             throw std::invalid_argument("invalid MOQT track namespace field");
         }
         write_varint(out, field.size());
-        append_bytes(out, field);
+        internal::append_bytes(out, field);
         total_size += field.size();
     }
-}
-
-ByteBuffer encode_setup(std::string authority, std::string path) {
-    ByteBuffer payload;
-    if (!path.empty()) {
-        append_setup_option_bytes(payload, 0x01, 0, path);
-    }
-    if (!authority.empty()) {
-        append_setup_option_bytes(payload, 0x05, path.empty() ? 0 : 0x01, authority);
-    }
-    append_setup_option_bytes(
-        payload, 0x07, authority.empty() ? (path.empty() ? 0 : 0x01) : 0x05,
-        "moqtopus/0.1");
-
-    ByteBuffer stream_bytes;
-    write_varint(stream_bytes, kSetupStreamType);
-    append_control_message(stream_bytes, kMessageSetup, payload);
-    return stream_bytes;
-}
-
-bool decode_setup(const ByteBuffer& payload, std::string& error) {
-    Cursor cursor{payload};
-    if (!skip_key_value_pairs(cursor)) {
-        error = "invalid SETUP options";
-        return false;
-    }
-    return true;
-}
-
-ByteBuffer encode_subscribe(RequestId request_id, const SubscribeRequest& request) {
-    ByteBuffer payload;
-    write_varint(payload, request_id);
-    write_track_namespace(payload, request.track_namespace);
-    write_varint(payload, request.track_name.size());
-    append_bytes(payload, request.track_name);
-    if (!encode_parameters(payload, request.parameters)) {
-        throw std::invalid_argument("SUBSCRIBE includes an unsupported or duplicate parameter");
-    }
-
-    ByteBuffer framed;
-    append_control_message(framed, kMessageSubscribe, payload);
-    return framed;
-}
-
-ByteBuffer encode_request_update(RequestId request_id, const RequestUpdate& update) {
-    ByteBuffer payload;
-    write_varint(payload, request_id);
-    if (!encode_parameters(payload, update.parameters)) {
-        throw std::invalid_argument(
-            "REQUEST_UPDATE includes an unsupported or duplicate parameter");
-    }
-    ByteBuffer framed;
-    append_control_message(framed, kMessageRequestUpdate, payload);
-    return framed;
-}
-
-ByteBuffer encode_request_error(uint64_t code, std::string reason, uint64_t retry_interval) {
-    ByteBuffer payload;
-    write_varint(payload, code);
-    write_varint(payload, retry_interval);
-    write_varint(payload, reason.size());
-    append_bytes(payload, reason);
-    ByteBuffer framed;
-    append_control_message(framed, kMessageRequestError, payload);
-    return framed;
-}
-
-std::optional<SubscribeOk> decode_subscribe_ok(
-    const ByteBuffer& payload, std::string& error) {
-    Cursor cursor{payload};
-    SubscribeOk ok;
-    uint64_t parameter_count = 0;
-    if (!cursor.read_varint(ok.track_alias) || !cursor.read_varint(parameter_count) ||
-        !read_parameters(cursor, parameter_count, ok.parameters, error)) {
-        if (error.empty()) {
-            error = "invalid SUBSCRIBE_OK";
-        }
-        return std::nullopt;
-    }
-    ok.track_properties.assign(
-        payload.begin() + static_cast<std::ptrdiff_t>(cursor.offset), payload.end());
-    return ok;
-}
-
-std::optional<RequestOk> decode_request_ok(
-    const ByteBuffer& payload, std::string& error) {
-    Cursor cursor{payload};
-    RequestOk ok;
-    uint64_t parameter_count = 0;
-    if (!cursor.read_varint(parameter_count) ||
-        !read_parameters(cursor, parameter_count, ok.parameters, error)) {
-        if (error.empty()) {
-            error = "invalid REQUEST_OK";
-        }
-        return std::nullopt;
-    }
-    ok.track_properties.assign(
-        payload.begin() + static_cast<std::ptrdiff_t>(cursor.offset), payload.end());
-    return ok;
-}
-
-std::optional<RequestError> decode_request_error(
-    const ByteBuffer& payload, std::string& error) {
-    Cursor cursor{payload};
-    RequestError decoded;
-    if (!cursor.read_varint(decoded.code) || !cursor.read_varint(decoded.retry_interval) ||
-        !read_reason(cursor, decoded.reason)) {
-        error = "invalid REQUEST_ERROR";
-        return std::nullopt;
-    }
-    if (decoded.code == 0x34) {
-        uint64_t uri_size = 0;
-        std::string uri;
-        uint64_t track_name_size = 0;
-        std::string track_name;
-        if (!cursor.read_varint(uri_size) || uri_size > 8192 ||
-            !cursor.read_string(static_cast<size_t>(uri_size), uri) ||
-            !read_track_namespace(cursor) || !cursor.read_varint(track_name_size) ||
-            track_name_size > 4096 ||
-            !cursor.read_string(static_cast<size_t>(track_name_size), track_name)) {
-            error = "invalid REQUEST_ERROR redirect";
-            return std::nullopt;
-        }
-    }
-    if (cursor.remaining() != 0) {
-        error = "trailing REQUEST_ERROR bytes";
-        return std::nullopt;
-    }
-    return decoded;
-}
-
-std::optional<PublishDone> decode_publish_done(
-    const ByteBuffer& payload, std::string& error) {
-    Cursor cursor{payload};
-    PublishDone decoded;
-    if (!cursor.read_varint(decoded.status_code) || !cursor.read_varint(decoded.stream_count) ||
-        !read_reason(cursor, decoded.reason) || cursor.remaining() != 0) {
-        error = "invalid PUBLISH_DONE";
-        return std::nullopt;
-    }
-    return decoded;
 }
 
 // Subgroup header is not a single fixed value
