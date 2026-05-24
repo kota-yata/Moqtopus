@@ -6,6 +6,13 @@ find_package(msquic CONFIG REQUIRED)
 
 add_library(moq_subscriber
   src/codec.cpp
+  src/codec/publish_done.cpp
+  src/codec/request_error.cpp
+  src/codec/request_ok.cpp
+  src/codec/request_update.cpp
+  src/codec/setup.cpp
+  src/codec/subscribe.cpp
+  src/codec/subscribe_ok.cpp
   src/data_plane.cpp
   src/executor.cpp
   src/msquic_transport_adapter.cpp
