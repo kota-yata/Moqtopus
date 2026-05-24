@@ -16,6 +16,7 @@ add_library(moq_subscriber
   src/data_plane.cpp
   src/executor.cpp
   src/peer_stream_demux.cpp
+  src/request/subscription.cpp
   src/msquic_transport_adapter.cpp
   src/subscriber_session.cpp
 )

@@ -35,7 +35,7 @@ void SubscriptionFSM::on_bytes(ByteBuffer bytes, bool fin) {
         response_buffer_.erase(response_buffer_.begin(), response_buffer_.begin() +
                                                  static_cast<std::ptrdiff_t>(parsed.bytes));
         handle_control_message(parsed.message);
-        if (phase_ == Phase::Terminated) {
+        if (phase_ == moq::SubscriptionPhase::Terminated) {
             return;
         }
     }
@@ -71,7 +71,7 @@ RequestId SubscriptionFSM::send_request_update(RequestId allocated_request_id,
 }
 
 void SubscriptionFSM::terminate(bool report_error, std::string reason) {
-    if (phase_ == Phase::Terminated) return;
+    if (phase_ == moq::SubscriptionPhase::Terminated) return;
     if (!subscribe_settled_) {
         // Owner is responsible for promise settling; mark as settled locally.
         subscribe_settled_ = true;
@@ -91,14 +91,14 @@ void SubscriptionFSM::terminate(bool report_error, std::string reason) {
         if (deactivate_route_cb_) deactivate_route_cb_(*track_alias_);
         if (remove_route_cb_) remove_route_cb_(*track_alias_);
     }
-    phase_ = Phase::Terminated;
+    phase_ = moq::SubscriptionPhase::Terminated;
     if (report_error && !reason.empty()) {
         handler_->on_error(ReceiveError{0, std::move(reason)});
     }
 }
 
 void SubscriptionFSM::handle_control_message(const codec::ControlMessage& message) {
-    if (phase_ == Phase::Pending) {
+    if (phase_ == moq::SubscriptionPhase::Pending) {
         if (message.type == codec::kMessageSubscribeOk) {
             accept_subscribe_ok(message);
             return;
@@ -112,7 +112,7 @@ void SubscriptionFSM::handle_control_message(const codec::ControlMessage& messag
         return;
     }
 
-    if (phase_ == Phase::Terminated) return;
+    if (phase_ == moq::SubscriptionPhase::Terminated) return;
     switch (message.type) {
     case codec::kMessageRequestOk:
         accept_request_ok(message);
@@ -151,7 +151,7 @@ void SubscriptionFSM::accept_subscribe_ok(const codec::ControlMessage& message) 
     }
     track_alias_ = ok->track_alias;
     route_ = std::move(route);
-    phase_ = Phase::Established;
+    phase_ = moq::SubscriptionPhase::Established;
     // Notify owner that subscribe was accepted. Owner will settle promises.
     subscribe_settled_ = true;
     if (subscribe_result_cb_) {
@@ -217,7 +217,7 @@ void SubscriptionFSM::reject_request_update(const codec::ControlMessage& message
             pending.promise->set_exception(exception);
         } catch (...) {}
     }
-    phase_ = Phase::UpdateFailed;
+    phase_ = moq::SubscriptionPhase::UpdateFailed;
 }
 
 void SubscriptionFSM::accept_publish_done(const codec::ControlMessage& message) {

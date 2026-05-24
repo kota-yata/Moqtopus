@@ -19,7 +19,6 @@ namespace moq::detail {
 // FSM for a single request stream (SUBSCRIBE / FETCH / ...).
 class SubscriptionFSM {
 public:
-    enum class Phase { Pending, Established, UpdateFailed, Terminated };
 
     struct PendingUpdate {
         RequestId request_id = 0;
@@ -60,7 +59,7 @@ public:
     // Stop the subscription and optionally report error to handler.
     void terminate(bool report_error, std::string reason);
 
-    Phase phase() const { return phase_; }
+    moq::SubscriptionPhase phase() const { return phase_; }
     RequestId request_id() const { return request_id_; }
 
 private:
@@ -73,7 +72,7 @@ private:
 
     RequestId request_id_;
     SubscribeRequest request_;
-    Phase phase_ = Phase::Pending;
+    moq::SubscriptionPhase phase_ = moq::SubscriptionPhase::Pending;
     std::optional<TrackAlias> track_alias_;
     std::shared_ptr<TransportStream> stream_;
     ByteBuffer response_buffer_;

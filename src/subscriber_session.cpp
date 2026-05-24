@@ -206,8 +206,6 @@ public:
     }
 
 private:
-    // per-request FSMs live in SubscriptionFSM
-
     // Send SETUP on connection establishment
     void on_connected() {
         if (phase_ != SessionPhase::Init) {
@@ -503,7 +501,7 @@ private:
         std::shared_ptr<std::promise<RequestOk>> promise) {
         const auto found = subscriptions_.find(existing_request_id);
         if (found == subscriptions_.end() ||
-            found->second->phase() != SubscriptionFSM::Phase::Established) {
+            found->second->phase() != moq::SubscriptionPhase::Established) {
             set_exception(promise, "REQUEST_UPDATE requires an established subscription");
             return;
         }
@@ -524,7 +522,7 @@ private:
         if (found == subscriptions_.end()) return;
         auto fsm = found->second;
         fsm->on_bytes(std::move(bytes), fin);
-        if (fin && fsm->phase() == SubscriptionFSM::Phase::Terminated) {
+        if (fin && fsm->phase() == moq::SubscriptionPhase::Terminated) {
             update_subscription_snapshot_from_fsm(request_id);
             refresh_session_snapshot();
             // keep entry until owner removes it explicitly
@@ -538,7 +536,7 @@ private:
         if (found == subscriptions_.end()) return;
         auto fsm = found->second;
         fsm->on_peer_send_aborted(error_code);
-        if (fsm->phase() == SubscriptionFSM::Phase::Terminated) {
+        if (fsm->phase() == moq::SubscriptionPhase::Terminated) {
             update_subscription_snapshot_from_fsm(request_id);
             refresh_session_snapshot();
         }
@@ -549,7 +547,7 @@ private:
         if (found == subscriptions_.end()) return;
         auto fsm = found->second;
         fsm->on_shutdown();
-        if (fsm->phase() == SubscriptionFSM::Phase::Terminated) {
+        if (fsm->phase() == moq::SubscriptionPhase::Terminated) {
             update_subscription_snapshot_from_fsm(request_id);
             refresh_session_snapshot();
         }
@@ -564,13 +562,6 @@ private:
         update_subscription_snapshot_from_fsm(request_id);
         refresh_session_snapshot();
         subscriptions_.erase(found);
-    }
-
-    void terminate_subscription(const std::shared_ptr<SubscriptionFSM>& fsm,
-                                bool report_error,
-                                std::string reason) {
-        // Not used; kept for compatibility. Prefer stop_subscription_on_executor.
-        (void)fsm; (void)report_error; (void)reason;
     }
 
     void malformed_track(RequestId request_id, std::string error) {
@@ -627,8 +618,6 @@ private:
         ready_waiters_.clear();
     }
 
-    // (old Subscription-based snapshot helper removed)
-
     void update_subscription_snapshot_from_fsm(RequestId request_id) {
         std::lock_guard<std::mutex> lock(snapshot_mutex_);
         const auto it = subscriptions_.find(request_id);
@@ -636,20 +625,7 @@ private:
         SubscriptionStateSnapshot snapshot;
         snapshot.request_id = request_id;
         const auto& fsm = it->second;
-        switch (fsm->phase()) {
-        case SubscriptionFSM::Phase::Pending:
-            snapshot.phase = SubscriptionPhase::Pending;
-            break;
-        case SubscriptionFSM::Phase::Established:
-            snapshot.phase = SubscriptionPhase::Established;
-            break;
-        case SubscriptionFSM::Phase::UpdateFailed:
-            snapshot.phase = SubscriptionPhase::UpdateFailed;
-            break;
-        case SubscriptionFSM::Phase::Terminated:
-            snapshot.phase = SubscriptionPhase::Terminated;
-            break;
-        }
+        snapshot.phase = fsm->phase();
         snapshot.track_alias = fsm->track_alias();
         snapshot.inflight_updates = fsm->inflight_updates();
         subscription_snapshots_[request_id] = snapshot;
@@ -668,7 +644,7 @@ private:
         size_t active = 0;
         for (const auto& entry : subscriptions_) {
             const auto& fsm = entry.second;
-            if (fsm && fsm->phase() != SubscriptionFSM::Phase::Terminated) {
+            if (fsm && fsm->phase() != moq::SubscriptionPhase::Terminated) {
                 ++active;
             }
         }
@@ -727,12 +703,6 @@ SubscriptionStateSnapshot SubscriptionHandle::state() const {
 MoqSubscriberSession::MoqSubscriberSession(std::shared_ptr<detail::SessionImpl> impl)
     : impl_(std::move(impl)) {}
 
-MoqSubscriberSession::~MoqSubscriberSession() {
-    if (impl_) {
-        impl_->close_and_wait(SessionCloseErrorCode::NoError);
-    }
-}
-
 std::future<std::unique_ptr<MoqSubscriberSession>> MoqSubscriberSession::connect(
     MsQuicClientConfig msquic_config,
     SubscriberConfig subscriber_config) {
@@ -776,6 +746,12 @@ std::future<void> MoqSubscriberSession::stop_subscription(RequestId request_id) 
 
 void MoqSubscriberSession::close(SessionCloseErrorCode error) {
     impl_->close(error);
+}
+
+MoqSubscriberSession::~MoqSubscriberSession() {
+    if (impl_) {
+        impl_->close_and_wait(SessionCloseErrorCode::NoError);
+    }
 }
 
 } // namespace moq
