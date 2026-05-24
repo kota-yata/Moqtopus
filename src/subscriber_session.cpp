@@ -3,6 +3,7 @@
 #include "data_plane.h"
 #include "moq/codec.h"
 #include "msquic_transport_adapter.h"
+#include "peer_stream_demux.h"
 
 #include <algorithm>
 #include <deque>
@@ -223,94 +224,7 @@ private:
         std::deque<PendingUpdate> updates;
     };
 
-    struct PeerUniDemux {
-        std::weak_ptr<SessionImpl> session;
-        std::shared_ptr<TransportStream> stream;
-        ByteBuffer bytes;
-
-        void feed(ByteBuffer input, bool fin) {
-            bytes.insert(bytes.end(), input.begin(), input.end());
-            const codec::VarintResult type = codec::read_varint(bytes);
-            if (type.status != codec::DecodeStatus::Done) {
-                if (fin) {
-                    if (auto locked = session.lock()) {
-                        locked->protocol_violation("peer unidirectional stream ended before type");
-                    }
-                }
-                return;
-            }
-            auto locked = session.lock();
-            if (!locked) {
-                return;
-            }
-            ByteBuffer initial = std::move(bytes);
-            if (type.value == codec::kSetupStreamType) {
-                ByteBuffer payload(
-                    initial.begin() + static_cast<std::ptrdiff_t>(type.bytes),
-                    initial.end());
-                std::weak_ptr<SessionImpl> weak = locked;
-                stream->on_bytes([weak](ByteBuffer next, bool bytes_fin) mutable {
-                    if (auto active = weak.lock()) {
-                        active->on_peer_control_bytes(std::move(next), bytes_fin);
-                    }
-                });
-                locked->on_peer_control_bytes(std::move(payload), fin);
-                return;
-            }
-            if (codec::is_subgroup_stream_type(type.value)) {
-                locked->data_plane_.start_subgroup_stream(stream, std::move(initial), fin);
-                return;
-            }
-            if (type.value == codec::kFetchStreamType) {
-                stream->abort_receive(0);
-                return;
-            }
-            if (type.value == codec::kPaddingStreamType) {
-                locked->start_padding_stream(stream, std::move(initial), type.bytes);
-                return;
-            }
-            locked->protocol_violation(
-                "unknown peer unidirectional stream type " + std::to_string(type.value));
-        }
-    };
-
-    struct PeerBidiDemux {
-        std::weak_ptr<SessionImpl> session;
-        std::shared_ptr<TransportStream> stream;
-        ByteBuffer bytes;
-
-        void feed(ByteBuffer input, bool fin) {
-            bytes.insert(bytes.end(), input.begin(), input.end());
-            const codec::ControlMessageResult message = codec::read_control_message(bytes);
-            if (message.status != codec::DecodeStatus::Done) {
-                if (fin) {
-                    if (auto active = session.lock()) {
-                        active->protocol_violation(
-                            "peer bidirectional stream ended before first request");
-                    }
-                }
-                return;
-            }
-            auto active = session.lock();
-            if (!active) {
-                return;
-            }
-            if (!known_peer_request_type(message.message.type)) {
-                active->protocol_violation(
-                    "unknown peer request type " + std::to_string(message.message.type));
-                return;
-            }
-            const uint64_t error_code =
-                message.message.type == codec::kMessagePublish ? 0x20 : 0x03;
-            const std::string reason =
-                message.message.type == codec::kMessagePublish
-                    ? "subscriber is not accepting PUBLISH"
-                    : "subscriber-only implementation";
-            stream->send(codec::encode_request_error(error_code, reason), true);
-            stream->abort_receive(0);
-        }
-    };
-
+    // Send SETUP on connection establishment
     void on_connected() {
         if (phase_ != SessionPhase::Init) {
             return;
@@ -334,17 +248,72 @@ private:
 
     void on_peer_stream_started(std::shared_ptr<TransportStream> stream) {
         if (stream->unidirectional()) {
-            auto demux = std::make_shared<PeerUniDemux>();
-            demux->session = weak_from_this();
-            demux->stream = stream;
+            auto demux = std::make_shared<PeerUniDemux>(
+                stream,
+                [weak = weak_from_this()](ByteBuffer bytes, bool fin) mutable {
+                    if (auto active = weak.lock()) {
+                        active->on_peer_control_bytes(std::move(bytes), fin);
+                    }
+                },
+                [weak = weak_from_this()](
+                    std::shared_ptr<TransportStream> peer_stream,
+                    ByteBuffer initial,
+                    bool fin) mutable {
+                    if (auto active = weak.lock()) {
+                        active->data_plane_.start_subgroup_stream(
+                            std::move(peer_stream), std::move(initial), fin);
+                    }
+                },
+                [weak = weak_from_this()](
+                    std::shared_ptr<TransportStream> peer_stream,
+                    ByteBuffer initial,
+                    size_t type_bytes) mutable {
+                    if (auto active = weak.lock()) {
+                        active->start_padding_stream(
+                            std::move(peer_stream), std::move(initial), type_bytes);
+                    }
+                },
+                [weak = weak_from_this()](std::shared_ptr<TransportStream> peer_stream) mutable {
+                    if (auto active = weak.lock()) {
+                        peer_stream->abort_receive(0);
+                    }
+                },
+                [weak = weak_from_this()](std::string error) mutable {
+                    if (auto active = weak.lock()) {
+                        active->protocol_violation(std::move(error));
+                    }
+                });
             stream->on_bytes([demux](ByteBuffer bytes, bool fin) mutable {
                 demux->feed(std::move(bytes), fin);
             });
             return;
         }
-        auto demux = std::make_shared<PeerBidiDemux>();
-        demux->session = weak_from_this();
-        demux->stream = stream;
+        auto demux = std::make_shared<PeerBidiDemux>(
+            stream,
+            [weak = weak_from_this()](
+                uint64_t request_type,
+                std::shared_ptr<TransportStream> peer_stream) mutable {
+                if (auto active = weak.lock()) {
+                    if (!known_peer_request_type(request_type)) {
+                        active->protocol_violation(
+                            "unknown peer request type " + std::to_string(request_type));
+                        return;
+                    }
+                    const uint64_t error_code =
+                        request_type == codec::kMessagePublish ? 0x20 : 0x03;
+                    const std::string reason =
+                        request_type == codec::kMessagePublish
+                            ? "subscriber is not accepting PUBLISH"
+                            : "subscriber-only implementation";
+                    peer_stream->send(codec::encode_request_error(error_code, reason), true);
+                    peer_stream->abort_receive(0);
+                }
+            },
+            [weak = weak_from_this()](std::string error) mutable {
+                if (auto active = weak.lock()) {
+                    active->protocol_violation(std::move(error));
+                }
+            });
         stream->on_bytes([demux](ByteBuffer bytes, bool fin) mutable {
             demux->feed(std::move(bytes), fin);
         });
