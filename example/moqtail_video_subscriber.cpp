@@ -9,94 +9,112 @@
 #include <memory>
 #include <thread>
 
-namespace {
+namespace
+{
 
-constexpr const char* kHost = "cdn.moq.dev";
-constexpr uint16_t kPort = 4433;
-constexpr const char* kPath = "/anon";
-constexpr const char* kNamespace = "moqtail";
-constexpr const char* kTrackName = "video0";
+    constexpr const char *kHost = "cdn.moq.dev";
+    constexpr uint16_t kPort = 9000;
+    constexpr const char *kPath = "/anon";
+    constexpr const char *kNamespace = "moqtail";
+    constexpr const char *kTrackName = "video0";
 
-std::atomic_bool interrupted{false};
+    std::atomic_bool interrupted{false};
 
-void OnSignal(int) {
-    interrupted.store(true);
-}
-
-const char* DeliveryName(moq::DeliveryKind delivery) {
-    switch (delivery) {
-    case moq::DeliveryKind::SubgroupStream:
-        return "subgroup";
-    case moq::DeliveryKind::Datagram:
-        return "datagram";
-    case moq::DeliveryKind::FetchStream:
-        return "fetch";
+    void OnSignal(int)
+    {
+        interrupted.store(true);
     }
-    return "unknown";
-}
 
-class VideoObjectPrinter final : public moq::ObjectHandler {
-public:
-    void on_object(moq::Object object) override {
-        ++object_count_;
-        total_payload_bytes_ += object.payload.size();
-
-        std::cout << "object #" << object_count_.load()
-                  << " delivery=" << DeliveryName(object.delivery_kind)
-                  << " group=" << object.group_id
-                  << " object=" << object.object_id;
-        if (object.subgroup_id) {
-            std::cout << " subgroup=" << *object.subgroup_id;
+    const char *DeliveryName(moq::DeliveryKind delivery)
+    {
+        switch (delivery)
+        {
+        case moq::DeliveryKind::SubgroupStream:
+            return "subgroup";
+        case moq::DeliveryKind::Datagram:
+            return "datagram";
+        case moq::DeliveryKind::FetchStream:
+            return "fetch";
         }
-        if (object.status) {
-            std::cout << " status=" << *object.status;
-        } else {
-            std::cout << " payload=" << object.payload.size() << " bytes";
+        return "unknown";
+    }
+
+    class VideoObjectPrinter final : public moq::ObjectHandler
+    {
+    public:
+        void on_object(moq::Object object) override
+        {
+            ++object_count_;
+            total_payload_bytes_ += object.payload.size();
+
+            std::cout << "object #" << object_count_.load()
+                      << " delivery=" << DeliveryName(object.delivery_kind)
+                      << " group=" << object.group_id
+                      << " object=" << object.object_id;
+            if (object.subgroup_id)
+            {
+                std::cout << " subgroup=" << *object.subgroup_id;
+            }
+            if (object.status)
+            {
+                std::cout << " status=" << *object.status;
+            }
+            else
+            {
+                std::cout << " payload=" << object.payload.size() << " bytes";
+            }
+            std::cout << '\n';
         }
-        std::cout << '\n';
-    }
 
-    void on_publish_done(moq::PublishDone done) override {
-        std::cout << "publisher finished track status=" << done.status_code
-                  << " streams=" << done.stream_count;
-        if (!done.reason.empty()) {
-            std::cout << " reason=\"" << done.reason << '"';
+        void on_publish_done(moq::PublishDone done) override
+        {
+            std::cout << "publisher finished track status=" << done.status_code
+                      << " streams=" << done.stream_count;
+            if (!done.reason.empty())
+            {
+                std::cout << " reason=\"" << done.reason << '"';
+            }
+            std::cout << '\n';
+            stopped_.store(true);
         }
-        std::cout << '\n';
-        stopped_.store(true);
-    }
 
-    void on_error(moq::ReceiveError error) override {
-        std::cerr << "receive error code=" << error.code
-                  << " message=\"" << error.message << "\"\n";
-        stopped_.store(true);
-    }
+        void on_error(moq::ReceiveError error) override
+        {
+            std::cerr << "receive error code=" << error.code
+                      << " message=\"" << error.message << "\"\n";
+            stopped_.store(true);
+        }
 
-    bool stopped() const {
-        return stopped_.load();
-    }
+        bool stopped() const
+        {
+            return stopped_.load();
+        }
 
-    uint64_t object_count() const {
-        return object_count_.load();
-    }
+        uint64_t object_count() const
+        {
+            return object_count_.load();
+        }
 
-    uint64_t total_payload_bytes() const {
-        return total_payload_bytes_.load();
-    }
+        uint64_t total_payload_bytes() const
+        {
+            return total_payload_bytes_.load();
+        }
 
-private:
-    std::atomic_bool stopped_{false};
-    std::atomic_uint64_t object_count_{0};
-    std::atomic_uint64_t total_payload_bytes_{0};
-};
+    private:
+        std::atomic_bool stopped_{false};
+        std::atomic_uint64_t object_count_{0};
+        std::atomic_uint64_t total_payload_bytes_{0};
+    };
 
 } // namespace
 
-int main() {
+int main()
+{
     std::signal(SIGINT, OnSignal);
     std::signal(SIGTERM, OnSignal);
 
-    try {
+    try
+    {
         moq::MsQuicClientConfig client;
         client.host = kHost;
         client.port = kPort;
@@ -119,12 +137,14 @@ int main() {
                   << " namespace=" << kNamespace
                   << " track=" << kTrackName
                   << " request=" << handle.request_id();
-        if (handle.track_alias()) {
+        if (handle.track_alias())
+        {
             std::cout << " alias=" << *handle.track_alias();
         }
         std::cout << '\n';
 
-        while (!interrupted.load() && !handler->stopped()) {
+        while (!interrupted.load() && !handler->stopped())
+        {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
@@ -135,7 +155,9 @@ int main() {
                   << " objects and " << handler->total_payload_bytes()
                   << " payload bytes\n";
         return 0;
-    } catch (const std::exception& error) {
+    }
+    catch (const std::exception &error)
+    {
         std::cerr << "subscriber failed: " << error.what() << '\n';
         return 1;
     }
