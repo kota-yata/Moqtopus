@@ -12,9 +12,9 @@
 namespace
 {
 
-    constexpr const char *kHost = "cdn.moq.dev";
-    constexpr uint16_t kPort = 9000;
-    constexpr const char *kPath = "/anon";
+    constexpr const char *kHost = "tcam.sfc.wide.ad.jp";
+    constexpr uint16_t kPort = 4433;
+    constexpr const char *kPath = "/moq";
     constexpr const char *kNamespace = "moqtail";
     constexpr const char *kTrackName = "video0";
 

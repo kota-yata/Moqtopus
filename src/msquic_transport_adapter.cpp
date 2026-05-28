@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include <msquichelper.h>
+
 namespace moq::detail
 {
     namespace
@@ -27,7 +29,7 @@ namespace moq::detail
         std::string status_message(const char *operation, QUIC_STATUS status)
         {
             std::ostringstream message;
-            message << operation << " failed with status 0x" << std::hex << status;
+            message << operation << " failed with status " << QuicStatusToString(status) << " (0x" << std::hex << status << ")";
             return message.str();
         }
 
@@ -341,6 +343,7 @@ namespace moq::detail
         {
             return;
         }
+        std::cout << "Connecting to " << config_.host << ":" << config_.port << " with ALPN " << config_.alpn << "..." << std::endl;
         const QUIC_STATUS status = api_->ConnectionStart(
             connection_,
             configuration_,
@@ -351,6 +354,7 @@ namespace moq::detail
         {
             throw std::runtime_error(status_message("ConnectionStart", status));
         }
+        std::cout << "Connection started." << std::endl;
         started_ = true;
     }
 
