@@ -26,10 +26,31 @@ namespace moq::detail
             QUIC_BUFFER buffer{};
         };
 
+        std::string status_to_string(QUIC_STATUS status)
+        {
+            switch (status)
+            {
+            case QUIC_STATUS_BAD_CERTIFICATE:
+                return "BAD_CERTIFICATE";
+            case QUIC_STATUS_UNSUPPORTED_CERTIFICATE:
+                return "UNSUPPORTED_CERTIFICATE";
+            case QUIC_STATUS_REVOKED_CERTIFICATE:
+                return "REVOKED_CERTIFICATE";
+            case QUIC_STATUS_EXPIRED_CERTIFICATE:
+                return "EXPIRED_CERTIFICATE";
+            case QUIC_STATUS_UNKNOWN_CERTIFICATE:
+                return "UNKNOWN_CERTIFICATE";
+            case QUIC_STATUS_REQUIRED_CERTIFICATE:
+                return "REQUIRED_CERTIFICATE";
+            default:
+                return QuicStatusToString(status);
+            }
+        }
+
         std::string status_message(const char *operation, QUIC_STATUS status)
         {
             std::ostringstream message;
-            message << operation << " failed with status " << QuicStatusToString(status) << " (0x" << std::hex << status << ")";
+            message << operation << " failed with status " << status_to_string(status) << " (0x" << std::hex << status << ")";
             return message.str();
         }
 
@@ -343,7 +364,6 @@ namespace moq::detail
         {
             return;
         }
-        std::cout << "Connecting to " << config_.host << ":" << config_.port << " with ALPN " << config_.alpn << "..." << std::endl;
         const QUIC_STATUS status = api_->ConnectionStart(
             connection_,
             configuration_,
@@ -354,7 +374,6 @@ namespace moq::detail
         {
             throw std::runtime_error(status_message("ConnectionStart", status));
         }
-        std::cout << "Connection started." << std::endl;
         started_ = true;
     }
 
@@ -422,12 +441,14 @@ namespace moq::detail
         switch (event->Type)
         {
         case QUIC_CONNECTION_EVENT_CONNECTED:
+        {
             executor_.post([callback = callbacks_.connected]
                            {
             if (callback) {
                 callback();
             } });
             break;
+        }
         case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED:
         {
             const bool unidirectional =
@@ -464,8 +485,7 @@ namespace moq::detail
         }
         case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
         {
-            const std::string message =
-                status_message("transport shutdown", event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status);
+            const std::string message = "Connection shutdown initiated by transport: " + status_to_string(event->SHUTDOWN_INITIATED_BY_TRANSPORT.ErrorCode);
             executor_.post([callback = callbacks_.transport_error, message]
                            {
             if (callback) {
@@ -475,9 +495,7 @@ namespace moq::detail
         }
         case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
         {
-            const std::string message =
-                "peer closed QUIC connection with error " +
-                std::to_string(event->SHUTDOWN_INITIATED_BY_PEER.ErrorCode);
+            const std::string message = "peer shutdown: " + status_to_string(event->SHUTDOWN_INITIATED_BY_PEER.ErrorCode);
             executor_.post([callback = callbacks_.transport_error, message]
                            {
             if (callback) {
