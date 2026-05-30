@@ -2,33 +2,44 @@
 
 #include "codec/internal.h"
 
-namespace moq::codec {
+namespace moq::codec
+{
 
-ByteBuffer encode_setup(std::string authority, std::string path) {
-    ByteBuffer payload;
-    if (!path.empty()) {
-        internal::append_setup_option_bytes(payload, 0x01, 0, path);
-    }
-    if (!authority.empty()) {
-        internal::append_setup_option_bytes(payload, 0x05, path.empty() ? 0 : 0x01, authority);
-    }
-    internal::append_setup_option_bytes(
-        payload, 0x07, authority.empty() ? (path.empty() ? 0 : 0x01) : 0x05,
-        "moqtopus/0.1");
+    ByteBuffer encode_setup(std::string authority, std::string path)
+    {
+        ByteBuffer payload;
+        if (!path.empty())
+        {
+            internal::append_setup_option_bytes(
+                payload, codec::SetupOption::Path, codec::SetupOption::None, path);
+        }
+        if (!authority.empty())
+        {
+            internal::append_setup_option_bytes(
+                payload, codec::SetupOption::Authority,
+                path.empty() ? codec::SetupOption::None : codec::SetupOption::Path, authority);
+        }
+        internal::append_setup_option_bytes(
+            payload, codec::SetupOption::MoqtImplementation,
+            authority.empty() ? (path.empty() ? codec::SetupOption::None : codec::SetupOption::Path)
+                              : codec::SetupOption::Authority,
+            "moqtopus/0.1.0");
 
-    ByteBuffer stream_bytes;
-    write_varint(stream_bytes, kSetupStreamType);
-    append_control_message(stream_bytes, kMessageSetup, payload);
-    return stream_bytes;
-}
-
-bool decode_setup(const ByteBuffer& payload, std::string& error) {
-    internal::Cursor cursor{payload};
-    if (!internal::skip_key_value_pairs(cursor)) {
-        error = "invalid SETUP options";
-        return false;
+        ByteBuffer stream_bytes;
+        write_varint(stream_bytes, kSetupStreamType);
+        append_control_message(stream_bytes, kMessageSetup, payload);
+        return stream_bytes;
     }
-    return true;
-}
+
+    bool decode_setup(const ByteBuffer &payload, std::string &error)
+    {
+        internal::Cursor cursor{payload};
+        if (!internal::skip_key_value_pairs(cursor))
+        {
+            error = "invalid SETUP options";
+            return false;
+        }
+        return true;
+    }
 
 } // namespace moq::codec

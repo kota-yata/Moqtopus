@@ -31,6 +31,17 @@ namespace moq::codec
     constexpr uint64_t kMessageSubscribeNamespace = 0x50;
     constexpr uint64_t kMessageSubscribeTracks = 0x51;
 
+    // Setup option identifiers
+    enum class SetupOption : uint64_t
+    {
+        // Setup option = None does not exist on the wire;
+        // it is only used as a placeholder for "no previous option"
+        None = 0x00,
+        Path = 0x01,
+        Authority = 0x05,
+        MoqtImplementation = 0x07,
+    };
+
     enum class DecodeStatus
     {
         Done,
