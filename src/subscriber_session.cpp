@@ -226,14 +226,14 @@ namespace moq::detail
         void close(SessionCloseErrorCode error)
         {
             executor_.post([self = shared_from_this(), error]
-                           { self->begin_close(static_cast<uint64_t>(error), "local close"); });
+                           { self->begin_close(error, "local close"); });
         }
 
         void close_and_wait(SessionCloseErrorCode error)
         {
             if (executor_.on_thread())
             {
-                begin_close(static_cast<uint64_t>(error), "local close");
+                begin_close(error, "local close");
                 return;
             }
 
@@ -269,9 +269,7 @@ namespace moq::detail
             }
             catch (const std::exception &error)
             {
-                begin_close(
-                    static_cast<uint64_t>(SessionCloseErrorCode::InternalError),
-                    error.what());
+                begin_close(SessionCloseErrorCode::InternalError, error.what());
             }
         }
 
@@ -527,7 +525,7 @@ namespace moq::detail
                         if (!active->data_plane_.install_route(alias, route))
                         {
                             active->begin_close(
-                                static_cast<uint64_t>(SessionCloseErrorCode::DuplicateTrackAlias),
+                                SessionCloseErrorCode::DuplicateTrackAlias,
                                 "SUBSCRIBE_OK reused an established Track Alias");
                             return false;
                         }
@@ -702,19 +700,15 @@ namespace moq::detail
 
         void protocol_violation(std::string error)
         {
-            begin_close(
-                static_cast<uint64_t>(SessionCloseErrorCode::ProtocolViolation),
-                std::move(error));
+            begin_close(SessionCloseErrorCode::ProtocolViolation, std::move(error));
         }
 
         void transport_error(std::string error)
         {
-            begin_close(
-                static_cast<uint64_t>(SessionCloseErrorCode::InternalError),
-                std::move(error));
+            begin_close(SessionCloseErrorCode::InternalError, std::move(error));
         }
 
-        void begin_close(uint64_t code, std::string reason)
+        void begin_close(SessionCloseErrorCode code, std::string reason)
         {
             if (phase_ == SessionPhase::Closed || phase_ == SessionPhase::Closing)
             {
@@ -740,7 +734,7 @@ namespace moq::detail
             if (!handshake_completed && !close_reason_)
             {
                 close_reason_ = SessionCloseReason{
-                    static_cast<uint64_t>(SessionCloseErrorCode::InternalError),
+                    SessionCloseErrorCode::InternalError,
                     "QUIC handshake did not complete"};
             }
             phase_ = SessionPhase::Closed;

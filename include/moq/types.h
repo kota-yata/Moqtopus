@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "moq/errors.h"
 #include <optional>
 #include <string>
 #include <vector>
@@ -112,7 +113,7 @@ namespace moq
 
     struct SessionCloseReason
     {
-        uint64_t code = 0;
+        SessionCloseErrorCode code = SessionCloseErrorCode::InternalError;
         std::string message;
     };
 

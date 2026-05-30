@@ -87,7 +87,7 @@ namespace moq::detail
 
         void start();
         std::shared_ptr<TransportStream> open_stream(bool unidirectional);
-        void shutdown(uint64_t error_code);
+        void shutdown(moq::SessionCloseErrorCode error_code);
 
         const QUIC_API_TABLE *api() const;
         Executor &executor();

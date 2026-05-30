@@ -410,11 +410,13 @@ namespace moq::detail
         return stream;
     }
 
-    void MsQuicTransportAdapter::shutdown(uint64_t error_code)
+    void MsQuicTransportAdapter::shutdown(moq::SessionCloseErrorCode error_code)
     {
         if (connection_)
         {
-            api_->ConnectionShutdown(connection_, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, error_code);
+            api_->ConnectionShutdown(
+                connection_, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE,
+                static_cast<uint64_t>(error_code));
         }
     }
 
