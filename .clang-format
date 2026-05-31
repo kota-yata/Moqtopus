@@ -1,0 +1,4 @@
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterCaseLabel: false
+ColumnLimit: 120
