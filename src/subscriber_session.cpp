@@ -101,9 +101,9 @@ public:
     transport_->start();
 
     const std::weak_ptr<SessionImpl> weak = weak_from_this();
-    peer_demux_callbacks_uni_.on_setup = [weak](ByteBuffer bytes, bool fin) mutable {
+    peer_demux_callbacks_uni_.on_setup = [weak](codec::Setup setup) mutable {
       if (auto active = weak.lock()) {
-        active->on_peer_control_bytes(std::move(bytes), fin);
+        active->handle_peer_setup(std::move(setup));
       }
     };
     peer_demux_callbacks_uni_.on_subgroup = [weak](std::shared_ptr<TransportStream> peer_stream, ByteBuffer initial,
@@ -235,6 +235,8 @@ private:
   void on_peer_stream_started(std::shared_ptr<TransportStream> stream) {
     if (stream->unidirectional()) {
       spdlog::debug("Peer started a unidirectional stream (id={})", stream->id());
+      // It could be unidirectional control streams (SETUP or GOAWAY) or subgroup/padding/fetch streams.
+      // So feed the bytes to default gateway demuxer
       auto demux = std::make_shared<PeerUniDemux>(stream, peer_demux_callbacks_uni_);
       stream->on_bytes([demux](ByteBuffer bytes, bool fin) mutable { demux->feed(std::move(bytes), fin); });
       return;
@@ -260,52 +262,10 @@ private:
     });
   }
 
-  void on_peer_control_bytes(ByteBuffer bytes, bool fin) {
-    peer_control_buffer_.insert(peer_control_buffer_.end(), bytes.begin(), bytes.end());
-    for (;;) {
-      const codec::ControlMessageResult parsed = codec::read_control_message(peer_control_buffer_);
-      if (parsed.status != codec::DecodeStatus::Done) {
-        break;
-      }
-      spdlog::debug("Received peer control message type={} payload={} bytes", parsed.message.type,
-                    parsed.message.payload.size());
-      peer_control_buffer_.erase(peer_control_buffer_.begin(),
-                                 peer_control_buffer_.begin() + static_cast<std::ptrdiff_t>(parsed.bytes));
-      handle_peer_control_message(parsed.message);
-      if (phase_ == SessionPhase::Closing || phase_ == SessionPhase::Closed) {
-        return;
-      }
-    }
-    if (fin && !peer_control_buffer_.empty()) {
-      protocol_violation("peer control stream ended mid-message");
-    }
-  }
-
-  // handles session-level control messages
-  void handle_peer_control_message(const codec::ControlMessage &message) {
-    if (!peer_setup_received_) {
-      if (message.type != codec::kMessageSetup) {
-        protocol_violation("first peer control message was not SETUP");
-        return;
-      }
-      spdlog::debug("Peer SETUP received");
-      std::string error;
-      if (!codec::decode_setup(message.payload, error)) {
-        protocol_violation(std::move(error));
-        return;
-      }
-      peer_setup_received_ = true;
-      maybe_ready();
-      return;
-    }
-    if (message.type == codec::kMessageGoAway) {
-      if (phase_ == SessionPhase::Ready) {
-        phase_ = SessionPhase::Draining;
-        refresh_session_snapshot();
-      }
-      return;
-    }
-    protocol_violation("unsupported control message " + std::to_string(message.type));
+  void handle_peer_setup(codec::Setup) {
+    spdlog::debug("Peer SETUP received");
+    peer_setup_received_ = true;
+    maybe_ready();
   }
 
   void maybe_ready() {
@@ -590,7 +550,6 @@ private:
   bool peer_setup_received_ = false;
   std::optional<SessionCloseReason> close_reason_;
   std::shared_ptr<TransportStream> local_setup_stream_;
-  ByteBuffer peer_control_buffer_;
   std::vector<std::shared_ptr<std::promise<void>>> ready_waiters_;
   std::unordered_map<RequestId, std::shared_ptr<SubscriptionFSM>> subscriptions_;
 

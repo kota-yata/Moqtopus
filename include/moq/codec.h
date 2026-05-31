@@ -65,6 +65,18 @@ struct ControlMessageResult {
   std::string error;
 };
 
+struct Setup {
+  struct Option {
+    uint64_t type = 0;
+    ByteBuffer value;
+  };
+
+  std::optional<std::string> path;
+  std::optional<std::string> authority;
+  std::optional<std::string> moqt_implementation;
+  std::vector<Option> options;
+};
+
 struct SubscribeOk {
   TrackAlias track_alias = 0;
   std::vector<Parameter> parameters;
@@ -77,7 +89,7 @@ void append_control_message(ByteBuffer &out, uint64_t type, const ByteBuffer &pa
 ControlMessageResult read_control_message(const ByteBuffer &bytes, size_t offset = 0);
 
 ByteBuffer encode_setup(std::string authority, std::string path);
-bool decode_setup(const ByteBuffer &payload, std::string &error);
+std::optional<Setup> decode_setup(const ByteBuffer &payload, std::string &error);
 ByteBuffer encode_subscribe(RequestId request_id, const SubscribeRequest &request);
 ByteBuffer encode_request_update(RequestId request_id, const RequestUpdate &update);
 ByteBuffer encode_request_error(uint64_t code, std::string reason, uint64_t retry_interval = 0);

@@ -11,7 +11,7 @@ namespace moq::detail {
 
 class PeerUniDemux final {
 public:
-  using OnSetup = std::function<void(ByteBuffer, bool)>;
+  using OnSetup = std::function<void(codec::Setup)>;
   using OnSubgroup = std::function<void(std::shared_ptr<TransportStream>, ByteBuffer, bool)>;
   using OnPadding = std::function<void(std::shared_ptr<TransportStream>, ByteBuffer, size_t)>;
   using OnFetch = std::function<void(std::shared_ptr<TransportStream>)>;
