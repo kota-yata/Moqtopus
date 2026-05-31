@@ -24,7 +24,7 @@ namespace moq::codec
             payload, codec::SetupOption::MoqtImplementation,
             authority.empty() ? (path.empty() ? codec::SetupOption::None : codec::SetupOption::Path)
                               : codec::SetupOption::Authority,
-            "moqtopus");
+            "kota-moqtopus");
 
         ByteBuffer stream_bytes;
         append_control_message(stream_bytes, kMessageSetup, payload);

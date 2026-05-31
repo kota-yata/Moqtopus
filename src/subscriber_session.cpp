@@ -281,11 +281,9 @@ namespace moq::detail
 
         void on_peer_stream_started(std::shared_ptr<TransportStream> stream)
         {
-            spdlog::debug(
-                "Peer started a new {} stream (id={})",
-                stream->unidirectional() ? "unidirectional" : "bidirectional", stream->id());
             if (stream->unidirectional())
             {
+                spdlog::debug("Peer started a unidirectional stream (id={})", stream->id());
                 auto demux = std::make_shared<PeerUniDemux>(
                     stream,
                     [weak = weak_from_this()](ByteBuffer bytes, bool fin) mutable
@@ -335,6 +333,7 @@ namespace moq::detail
                                  { demux->feed(std::move(bytes), fin); });
                 return;
             }
+            spdlog::debug("Peer started a bidirectional stream (id={})", stream->id());
             auto demux = std::make_shared<PeerBidiDemux>(
                 stream,
                 [weak = weak_from_this()](
