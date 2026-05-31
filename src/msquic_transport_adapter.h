@@ -1,6 +1,5 @@
 #pragma once
 
-#include "executor.h"
 #include "moq/subscriber_session.h"
 #include "moq/types.h"
 
@@ -68,7 +67,7 @@ public:
     std::function<void(bool)> shutdown_complete;
   };
 
-  MsQuicTransportAdapter(Executor &executor, MsQuicClientConfig config, Callbacks callbacks);
+  MsQuicTransportAdapter(MsQuicClientConfig config, Callbacks callbacks);
   ~MsQuicTransportAdapter();
 
   MsQuicTransportAdapter(const MsQuicTransportAdapter &) = delete;
@@ -79,7 +78,6 @@ public:
   void shutdown(moq::SessionCloseErrorCode error_code);
 
   const QUIC_API_TABLE *api() const;
-  Executor &executor();
 
 private:
   friend class TransportStream;
@@ -89,7 +87,6 @@ private:
   void remove_stream(TransportStream *stream);
   void close_connection_handle(HQUIC connection);
 
-  Executor &executor_;
   MsQuicClientConfig config_;
   Callbacks callbacks_;
   const QUIC_API_TABLE *api_ = nullptr;

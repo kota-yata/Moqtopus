@@ -1,6 +1,5 @@
 #include "msquic_transport_adapter.h"
 
-#include <iomanip>
 #include <iostream>
 #include <spdlog/spdlog.h>
 #include <sstream>
@@ -128,32 +127,18 @@ QUIC_STATUS TransportStream::handle_event(HQUIC stream, QUIC_STREAM_EVENT *event
     set_id(event->START_COMPLETE.ID);
     if (QUIC_FAILED(event->START_COMPLETE.Status)) {
       const std::string message = status_message("StreamStart", event->START_COMPLETE.Status);
-      adapter_.executor().post([callback = adapter_.callbacks_.transport_error, message] {
-        if (callback) {
-          callback(message);
-        }
-      });
+      adapter_.callbacks_.transport_error(message);
     }
     break;
   }
   case QUIC_STREAM_EVENT_RECEIVE: {
     ByteBuffer bytes = copy_buffers(event->RECEIVE.Buffers, event->RECEIVE.BufferCount);
     const bool fin = (event->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
-    const std::shared_ptr<TransportStream> self = shared_from_this();
-    adapter_.executor().post([self, bytes = std::move(bytes), fin]() mutable {
-      if (self->bytes_callback_) {
-        self->bytes_callback_(std::move(bytes), fin);
-      }
-    });
+    bytes_callback_(std::move(bytes), fin);
     break;
   }
   case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN: {
-    const std::shared_ptr<TransportStream> self = shared_from_this();
-    adapter_.executor().post([self]() mutable {
-      if (self->bytes_callback_) {
-        self->bytes_callback_(ByteBuffer{}, true);
-      }
-    });
+    bytes_callback_(ByteBuffer{}, true);
     break;
   }
   case QUIC_STREAM_EVENT_SEND_COMPLETE:
@@ -161,32 +146,17 @@ QUIC_STATUS TransportStream::handle_event(HQUIC stream, QUIC_STREAM_EVENT *event
     break;
   case QUIC_STREAM_EVENT_PEER_SEND_ABORTED: {
     const uint64_t error_code = event->PEER_SEND_ABORTED.ErrorCode;
-    const std::shared_ptr<TransportStream> self = shared_from_this();
-    adapter_.executor().post([self, error_code] {
-      if (self->peer_send_aborted_callback_) {
-        self->peer_send_aborted_callback_(error_code);
-      }
-    });
+    peer_send_aborted_callback_(error_code);
     break;
   }
   case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED: {
     const uint64_t error_code = event->PEER_RECEIVE_ABORTED.ErrorCode;
-    const std::shared_ptr<TransportStream> self = shared_from_this();
-    adapter_.executor().post([self, error_code] {
-      if (self->peer_receive_aborted_callback_) {
-        self->peer_receive_aborted_callback_(error_code);
-      }
-    });
+    peer_receive_aborted_callback_(error_code);
     break;
   }
   case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE: {
-    const std::shared_ptr<TransportStream> self = shared_from_this();
     close_handle(stream);
-    adapter_.executor().post([self] {
-      if (self->shutdown_callback_) {
-        self->shutdown_callback_();
-      }
-    });
+    shutdown_callback_();
     adapter_.remove_stream(this);
     break;
   }
@@ -203,8 +173,8 @@ void TransportStream::close_handle(HQUIC stream) {
   }
 }
 
-MsQuicTransportAdapter::MsQuicTransportAdapter(Executor &executor, MsQuicClientConfig config, Callbacks callbacks)
-    : executor_(executor), config_(std::move(config)), callbacks_(std::move(callbacks)) {
+MsQuicTransportAdapter::MsQuicTransportAdapter(MsQuicClientConfig config, Callbacks callbacks)
+    : config_(std::move(config)), callbacks_(std::move(callbacks)) {
   QUIC_STATUS status = MsQuicOpen2(&api_);
   if (QUIC_FAILED(status)) {
     throw std::runtime_error(status_message("MsQuicOpen2", status));
@@ -329,8 +299,6 @@ void MsQuicTransportAdapter::shutdown(moq::SessionCloseErrorCode error_code) {
 
 const QUIC_API_TABLE *MsQuicTransportAdapter::api() const { return api_; }
 
-Executor &MsQuicTransportAdapter::executor() { return executor_; }
-
 QUIC_STATUS QUIC_API MsQuicTransportAdapter::connection_callback(HQUIC connection, void *context,
                                                                  QUIC_CONNECTION_EVENT *event) {
   return static_cast<MsQuicTransportAdapter *>(context)->handle_connection_event(connection, event);
@@ -339,11 +307,7 @@ QUIC_STATUS QUIC_API MsQuicTransportAdapter::connection_callback(HQUIC connectio
 QUIC_STATUS MsQuicTransportAdapter::handle_connection_event(HQUIC connection, QUIC_CONNECTION_EVENT *event) {
   switch (event->Type) {
   case QUIC_CONNECTION_EVENT_CONNECTED: {
-    executor_.post([callback = callbacks_.connected] {
-      if (callback) {
-        callback();
-      }
-    });
+    callbacks_.connected();
     break;
   }
   case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED: {
@@ -356,51 +320,31 @@ QUIC_STATUS MsQuicTransportAdapter::handle_connection_event(HQUIC connection, QU
       std::lock_guard<std::mutex> lock(streams_mutex_);
       streams_.emplace(stream.get(), stream);
     }
-    executor_.post([callback = callbacks_.peer_stream_started, stream] {
-      if (callback) {
-        callback(stream);
-      }
-    });
+    callbacks_.peer_stream_started(stream);
     break;
   }
   case QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED: {
     ByteBuffer bytes(event->DATAGRAM_RECEIVED.Buffer->Buffer,
                      event->DATAGRAM_RECEIVED.Buffer->Buffer + event->DATAGRAM_RECEIVED.Buffer->Length);
-    executor_.post([callback = callbacks_.datagram_received, bytes = std::move(bytes)]() mutable {
-      if (callback) {
-        callback(std::move(bytes));
-      }
-    });
+    callbacks_.datagram_received(std::move(bytes));
     break;
   }
   case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT: {
     const std::string message = "Connection shutdown initiated by transport: " +
                                 status_to_string(event->SHUTDOWN_INITIATED_BY_TRANSPORT.ErrorCode);
-    executor_.post([callback = callbacks_.transport_error, message] {
-      if (callback) {
-        callback(message);
-      }
-    });
+    callbacks_.transport_error(message);
     break;
   }
   case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER: {
     const std::string message = "peer shutdown: " + status_to_string(event->SHUTDOWN_INITIATED_BY_PEER.ErrorCode);
-    executor_.post([callback = callbacks_.transport_error, message] {
-      if (callback) {
-        callback(message);
-      }
-    });
+    callbacks_.transport_error(message);
     break;
   }
   case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE: {
     const bool handshake_completed = event->SHUTDOWN_COMPLETE.HandshakeCompleted != FALSE;
     spdlog::debug("MsQuic connection shutdown complete: handshake_completed={}", handshake_completed);
     close_connection_handle(connection);
-    executor_.post([callback = callbacks_.shutdown_complete, handshake_completed] {
-      if (callback) {
-        callback(handshake_completed);
-      }
-    });
+    callbacks_.shutdown_complete(handshake_completed);
     break;
   }
   default:

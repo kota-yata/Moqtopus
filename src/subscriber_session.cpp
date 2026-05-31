@@ -86,10 +86,7 @@ private:
   PeerBidiDemux::SessionCallbacksBidi peer_demux_callbacks_bidi_;
 
 public:
-  ~SessionImpl() {
-    close_and_wait(SessionCloseErrorCode::NoError);
-    executor_.stop();
-  }
+  ~SessionImpl() { close_and_wait(SessionCloseErrorCode::NoError); }
 
   void start() {
     MsQuicTransportAdapter::Callbacks callbacks;
@@ -100,7 +97,7 @@ public:
     callbacks.datagram_received = [this](ByteBuffer bytes) { data_plane_.on_datagram(std::move(bytes)); };
     callbacks.transport_error = [this](std::string error) { transport_error(std::move(error)); };
     callbacks.shutdown_complete = [this](bool handshake) { shutdown_complete(handshake); };
-    transport_ = std::make_unique<MsQuicTransportAdapter>(executor_, msquic_config_, std::move(callbacks));
+    transport_ = std::make_unique<MsQuicTransportAdapter>(msquic_config_, std::move(callbacks));
     transport_->start();
 
     const std::weak_ptr<SessionImpl> weak = weak_from_this();
@@ -152,17 +149,15 @@ public:
   std::future<void> ready() {
     auto promise = std::make_shared<std::promise<void>>();
     std::future<void> future = promise->get_future();
-    executor_.post([self = shared_from_this(), promise] {
-      if (self->phase_ == SessionPhase::Ready || self->phase_ == SessionPhase::Draining) {
-        promise->set_value();
-        return;
-      }
-      if (self->phase_ == SessionPhase::Closing || self->phase_ == SessionPhase::Closed) {
-        set_exception(promise, "MOQT session closed before SETUP completed");
-        return;
-      }
-      self->ready_waiters_.push_back(promise);
-    });
+    if (phase_ == SessionPhase::Ready || phase_ == SessionPhase::Draining) {
+      promise->set_value();
+      return future;
+    }
+    if (phase_ == SessionPhase::Closing || phase_ == SessionPhase::Closed) {
+      set_exception(promise, "MOQT session closed before SETUP completed");
+      return future;
+    }
+    ready_waiters_.push_back(promise);
     return future;
   }
 
@@ -186,50 +181,33 @@ public:
   std::future<SubscriptionHandle> subscribe(SubscribeRequest request, std::shared_ptr<ObjectHandler> handler) {
     auto promise = std::make_shared<std::promise<SubscriptionHandle>>();
     std::future<SubscriptionHandle> future = promise->get_future();
-    executor_.post([self = shared_from_this(), request = std::move(request), handler, promise]() mutable {
-      self->subscribe_on_executor(std::move(request), std::move(handler), std::move(promise));
-    });
+    subscribe_on_executor(std::move(request), std::move(handler), std::move(promise));
     return future;
   }
 
   std::future<RequestOk> request_update(RequestId existing_request_id, RequestUpdate update) {
     auto promise = std::make_shared<std::promise<RequestOk>>();
     std::future<RequestOk> future = promise->get_future();
-    executor_.post([self = shared_from_this(), existing_request_id, update = std::move(update), promise]() mutable {
-      self->request_update_on_executor(existing_request_id, std::move(update), std::move(promise));
-    });
+    request_update_on_executor(existing_request_id, std::move(update), std::move(promise));
     return future;
   }
 
   std::future<void> stop_subscription(RequestId request_id) {
     auto promise = std::make_shared<std::promise<void>>();
     std::future<void> future = promise->get_future();
-    executor_.post([self = shared_from_this(), request_id, promise] {
-      self->stop_subscription_on_executor(request_id, false);
-      promise->set_value();
-    });
+    stop_subscription_on_executor(request_id, false);
+    promise->set_value();
     return future;
   }
 
   void close(SessionCloseErrorCode error) {
     spdlog::debug("Session close requested: code={}", static_cast<uint64_t>(error));
-    executor_.post([self = shared_from_this(), error] { self->begin_close(error, "local close"); });
+    begin_close(error, "local close");
   }
 
   void close_and_wait(SessionCloseErrorCode error) {
     spdlog::debug("Session close-and-wait requested: code={}", static_cast<uint64_t>(error));
-    if (executor_.on_thread()) {
-      begin_close(error, "local close");
-      return;
-    }
-
-    auto promise = std::make_shared<std::promise<void>>();
-    std::future<void> future = promise->get_future();
-    executor_.post([this, error, promise] {
-      begin_close(error, "local close");
-      promise->set_value();
-    });
-    future.wait();
+    begin_close(error, "local close");
   }
 
 private:
@@ -601,7 +579,6 @@ private:
     session_snapshot_.close_reason = close_reason_;
   }
 
-  Executor executor_;
   MsQuicClientConfig msquic_config_;
   SubscriberConfig subscriber_config_;
   DataPlane data_plane_;

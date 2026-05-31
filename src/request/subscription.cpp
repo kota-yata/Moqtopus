@@ -36,7 +36,6 @@ void SubscriptionFSM::on_bytes(ByteBuffer bytes, bool fin) {
     }
   }
   if (fin && !response_buffer_.empty()) {
-    // Protocol violation; notify owner through handler
     handler_->on_error(ReceiveError{0, "request stream ended mid-message"});
     terminate(true, "request stream ended mid-message");
   }
