@@ -19,14 +19,14 @@ namespace moq::codec
                 payload, codec::SetupOption::Authority,
                 path.empty() ? codec::SetupOption::None : codec::SetupOption::Path, authority);
         }
+        // Fixed value for MOQT_IMPLEMENTATION
         internal::append_setup_option_bytes(
             payload, codec::SetupOption::MoqtImplementation,
             authority.empty() ? (path.empty() ? codec::SetupOption::None : codec::SetupOption::Path)
                               : codec::SetupOption::Authority,
-            "moqtopus/0.1.0");
+            "moqtopus");
 
         ByteBuffer stream_bytes;
-        write_varint(stream_bytes, kSetupStreamType);
         append_control_message(stream_bytes, kMessageSetup, payload);
         return stream_bytes;
     }
