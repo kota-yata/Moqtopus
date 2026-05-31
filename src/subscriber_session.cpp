@@ -82,7 +82,7 @@ public:
   }
 
 private:
-  PeerUniDemux::SessionCallbacks peer_demux_callbacks_;
+  PeerUniDemux::SessionCallbacks peer_demux_callbacks_uni_;
   PeerBidiDemux::SessionCallbacksBidi peer_demux_callbacks_bidi_;
 
 public:
@@ -103,38 +103,35 @@ public:
     transport_ = std::make_unique<MsQuicTransportAdapter>(executor_, msquic_config_, std::move(callbacks));
     transport_->start();
 
-    // prepare a reusable set of callbacks for demux so we don't recreate
-    // identical lambdas per incoming stream.
     const std::weak_ptr<SessionImpl> weak = weak_from_this();
-    peer_demux_callbacks_.on_setup = [weak](ByteBuffer bytes, bool fin) mutable {
+    peer_demux_callbacks_uni_.on_setup = [weak](ByteBuffer bytes, bool fin) mutable {
       if (auto active = weak.lock()) {
         active->on_peer_control_bytes(std::move(bytes), fin);
       }
     };
-    peer_demux_callbacks_.on_subgroup = [weak](std::shared_ptr<TransportStream> peer_stream, ByteBuffer initial,
-                                               bool fin) mutable {
+    peer_demux_callbacks_uni_.on_subgroup = [weak](std::shared_ptr<TransportStream> peer_stream, ByteBuffer initial,
+                                                   bool fin) mutable {
       if (auto active = weak.lock()) {
         active->data_plane_.start_subgroup_stream(std::move(peer_stream), std::move(initial), fin);
       }
     };
-    peer_demux_callbacks_.on_padding = [weak](std::shared_ptr<TransportStream> peer_stream, ByteBuffer initial,
-                                              size_t type_bytes) mutable {
+    peer_demux_callbacks_uni_.on_padding = [weak](std::shared_ptr<TransportStream> peer_stream, ByteBuffer initial,
+                                                  size_t type_bytes) mutable {
       if (auto active = weak.lock()) {
         active->start_padding_stream(std::move(peer_stream), std::move(initial), type_bytes);
       }
     };
-    peer_demux_callbacks_.on_fetch = [](std::shared_ptr<TransportStream> peer_stream) mutable {
+    peer_demux_callbacks_uni_.on_fetch = [](std::shared_ptr<TransportStream> peer_stream) mutable {
       if (peer_stream) {
         peer_stream->abort_receive(0);
       }
     };
-    peer_demux_callbacks_.on_protocol_violation = [weak](std::string error) mutable {
+    peer_demux_callbacks_uni_.on_protocol_violation = [weak](std::string error) mutable {
       if (auto active = weak.lock()) {
         active->protocol_violation(std::move(error));
       }
     };
-    // bidi callbacks reuse protocol_violation and define request handling
-    peer_demux_callbacks_bidi_.on_protocol_violation = peer_demux_callbacks_.on_protocol_violation;
+    peer_demux_callbacks_bidi_.on_protocol_violation = peer_demux_callbacks_uni_.on_protocol_violation;
     peer_demux_callbacks_bidi_.on_request = [weak](uint64_t request_type,
                                                    std::shared_ptr<TransportStream> peer_stream) mutable {
       if (auto active = weak.lock()) {
@@ -260,7 +257,7 @@ private:
   void on_peer_stream_started(std::shared_ptr<TransportStream> stream) {
     if (stream->unidirectional()) {
       spdlog::debug("Peer started a unidirectional stream (id={})", stream->id());
-      auto demux = std::make_shared<PeerUniDemux>(stream, peer_demux_callbacks_);
+      auto demux = std::make_shared<PeerUniDemux>(stream, peer_demux_callbacks_uni_);
       stream->on_bytes([demux](ByteBuffer bytes, bool fin) mutable { demux->feed(std::move(bytes), fin); });
       return;
     }
