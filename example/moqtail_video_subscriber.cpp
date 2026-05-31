@@ -61,7 +61,7 @@ public:
   }
 
   void on_error(moq::ReceiveError error) override {
-    std::cerr << "receive error code=" << error.code << " message=\"" << error.message << "\"\n";
+    spdlog::error("receive error code={} message=\"{}\"", error.code, error.message);
     stopped_.store(true);
   }
 
@@ -116,7 +116,7 @@ int main() {
 
     return 0;
   } catch (const std::exception &error) {
-    std::cerr << "subscriber failed: " << error.what() << '\n';
+    spdlog::error("subscriber failed: {}", error.what());
     return 1;
   }
 }

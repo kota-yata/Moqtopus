@@ -2,6 +2,7 @@
 
 #include "codec/internal.h"
 #include "moq/errors.h"
+#include "spdlog/spdlog.h"
 
 #include <algorithm>
 #include <array>
@@ -401,9 +402,11 @@ void append_control_message(ByteBuffer &out, uint64_t type, const ByteBuffer &pa
 ControlMessageResult read_control_message(const ByteBuffer &bytes, size_t offset) {
   const VarintResult type = read_varint(bytes, offset);
   if (type.status != DecodeStatus::Done) {
+    spdlog::error("read_control_message failed: byte underflow");
     return {};
   }
   if (bytes.size() - offset < type.bytes + 2) {
+    spdlog::error("read_control_message failed: byte underflow");
     return {};
   }
   const size_t length_offset = offset + type.bytes;
@@ -411,6 +414,7 @@ ControlMessageResult read_control_message(const ByteBuffer &bytes, size_t offset
       static_cast<uint16_t>((static_cast<uint16_t>(bytes[length_offset]) << 8) | bytes[length_offset + 1]);
   const size_t frame_size = type.bytes + 2 + length;
   if (bytes.size() - offset < frame_size) {
+    spdlog::error("read_control_message failed: byte underflow");
     return {};
   }
 

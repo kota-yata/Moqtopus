@@ -94,7 +94,7 @@ public:
   }
 
   void on_error(moq::ReceiveError error) override {
-    std::cerr << "receive error code=" << error.code << " message=\"" << error.message << "\"\n";
+    spdlog::error("receive error code={} message=\"{}\"", error.code, error.message);
     done_.store(true);
   }
 
@@ -105,10 +105,8 @@ private:
 };
 
 void Usage(const char *argv0) {
-  std::cerr << "usage: " << argv0
-            << " <host> <port> <namespace[/field...]> <track-name>"
-               " [path] [alpn]\n"
-            << "example: " << argv0 << " localhost 4433 camera/front video / moqt-18\n";
+  spdlog::error("usage: {} <host> <port> <namespace[/field...]> <track-name> [path] [alpn]", argv0);
+  spdlog::error("example: {} localhost 4433 camera/front video / moqt-18", argv0);
 }
 
 } // namespace
@@ -125,7 +123,7 @@ int main(int argc, char **argv) {
     moq::MsQuicClientConfig client_config;
     client_config.host = argv[1];
     if (!ParsePort(argv[2], client_config.port)) {
-      std::cerr << "invalid port: " << argv[2] << '\n';
+      spdlog::error("invalid port: {}", argv[2]);
       return 2;
     }
     client_config.path = argc >= 6 ? argv[5] : "/";
@@ -155,7 +153,7 @@ int main(int argc, char **argv) {
     session->close();
     return 0;
   } catch (const std::exception &error) {
-    std::cerr << error.what() << '\n';
+    spdlog::error("subscriber failed: {}", error.what());
     return 1;
   }
 }
