@@ -5,6 +5,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <utility>
+#include <spdlog/spdlog.h>
 
 #include <msquichelper.h>
 
@@ -414,6 +415,9 @@ namespace moq::detail
     {
         if (connection_)
         {
+            spdlog::debug(
+                "MsQuicTransportAdapter shutdown requested: code={}",
+                static_cast<uint64_t>(error_code));
             api_->ConnectionShutdown(
                 connection_, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE,
                 static_cast<uint64_t>(error_code));
@@ -508,6 +512,9 @@ namespace moq::detail
         case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
         {
             const bool handshake_completed = event->SHUTDOWN_COMPLETE.HandshakeCompleted != FALSE;
+            spdlog::debug(
+                "MsQuic connection shutdown complete: handshake_completed={}",
+                handshake_completed);
             close_connection_handle(connection);
             executor_.post([callback = callbacks_.shutdown_complete, handshake_completed]
                            {

@@ -225,12 +225,14 @@ namespace moq::detail
 
         void close(SessionCloseErrorCode error)
         {
+            spdlog::debug("Session close requested: code={}", static_cast<uint64_t>(error));
             executor_.post([self = shared_from_this(), error]
                            { self->begin_close(error, "local close"); });
         }
 
         void close_and_wait(SessionCloseErrorCode error)
         {
+            spdlog::debug("Session close-and-wait requested: code={}", static_cast<uint64_t>(error));
             if (executor_.on_thread())
             {
                 begin_close(error, "local close");
@@ -723,6 +725,9 @@ namespace moq::detail
             {
                 return;
             }
+            spdlog::debug(
+                "Session beginning close: code={} reason={}",
+                static_cast<uint64_t>(code), reason);
             phase_ = SessionPhase::Closing;
             close_reason_ = SessionCloseReason{code, reason};
             fail_ready_waiters(reason.empty() ? "MOQT session closing" : reason);
@@ -740,6 +745,9 @@ namespace moq::detail
 
         void shutdown_complete(bool handshake_completed)
         {
+            spdlog::debug(
+                "Session shutdown complete: handshake_completed={} close_reason_set={}",
+                handshake_completed, static_cast<bool>(close_reason_));
             if (!handshake_completed && !close_reason_)
             {
                 close_reason_ = SessionCloseReason{
@@ -914,6 +922,7 @@ namespace moq
     {
         if (impl_)
         {
+            spdlog::debug("MoqSubscriberSession destructor initiating shutdown wait");
             impl_->close_and_wait(SessionCloseErrorCode::NoError);
         }
     }
