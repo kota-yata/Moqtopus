@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.21)
 project(moqtopus LANGUAGES CXX)
 
 find_package(msquic CONFIG REQUIRED)
+find_package(spdlog CONFIG REQUIRED)
 
 add_library(moq_subscriber
   src/codec.cpp
@@ -26,6 +27,8 @@ target_include_directories(moq_subscriber
   PRIVATE src
 )
 target_link_libraries(moq_subscriber PRIVATE msquic)
+target_link_libraries(moq_subscriber PUBLIC spdlog::spdlog)
+target_compile_definitions(moq_subscriber PRIVATE SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_DEBUG)
 
 add_executable(moqtopus src/main.cpp)
 target_link_libraries(moqtopus PRIVATE moq_subscriber)

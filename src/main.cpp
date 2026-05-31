@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <spdlog/spdlog.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -152,6 +153,8 @@ namespace
 
 int main(int argc, char **argv)
 {
+    spdlog::set_level(spdlog::level::debug);
+
     if (argc < 5 || argc > 7)
     {
         Usage(argv[0]);

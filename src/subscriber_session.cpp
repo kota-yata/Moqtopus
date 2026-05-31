@@ -12,11 +12,11 @@
 #include <future>
 #include <limits>
 #include <mutex>
+#include <spdlog/spdlog.h>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include <iostream>
 
 namespace moq::detail
 {
@@ -257,6 +257,9 @@ namespace moq::detail
             phase_ = SessionPhase::SetupInProgress;
             try
             {
+                spdlog::debug(
+                    "MOQT connected; sending SETUP authority={} path={}",
+                    default_authority(msquic_config_), msquic_config_.path);
                 local_setup_stream_ = transport_->open_stream(true);
                 if (!local_setup_stream_->send(
                         codec::encode_setup(
@@ -264,6 +267,7 @@ namespace moq::detail
                 {
                     throw std::runtime_error("StreamSend failed for SETUP");
                 }
+                spdlog::debug("Local SETUP sent; waiting for peer SETUP");
                 local_setup_sent_ = true;
                 refresh_session_snapshot();
             }
@@ -275,8 +279,9 @@ namespace moq::detail
 
         void on_peer_stream_started(std::shared_ptr<TransportStream> stream)
         {
-            std::cout << "Peer started a new " << (stream->unidirectional() ? "unidirectional" : "bidirectional")
-                      << " stream (id=" << stream->id() << ")\n";
+            spdlog::debug(
+                "Peer started a new {} stream (id={})",
+                stream->unidirectional() ? "unidirectional" : "bidirectional", stream->id());
             if (stream->unidirectional())
             {
                 auto demux = std::make_shared<PeerUniDemux>(
@@ -398,6 +403,9 @@ namespace moq::detail
                 {
                     break;
                 }
+                spdlog::debug(
+                    "Received peer control message type={} payload={} bytes",
+                    parsed.message.type, parsed.message.payload.size());
                 peer_control_buffer_.erase(
                     peer_control_buffer_.begin(),
                     peer_control_buffer_.begin() + static_cast<std::ptrdiff_t>(parsed.bytes));
@@ -454,6 +462,7 @@ namespace moq::detail
                 refresh_session_snapshot();
                 return;
             }
+            spdlog::debug("MOQT SETUP completed; session ready");
             phase_ = SessionPhase::Ready;
             for (const auto &waiter : ready_waiters_)
             {

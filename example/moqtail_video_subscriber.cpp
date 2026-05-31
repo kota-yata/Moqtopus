@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <spdlog/spdlog.h>
 #include <thread>
 
 namespace
@@ -110,6 +111,8 @@ namespace
 
 int main()
 {
+    spdlog::set_level(spdlog::level::debug);
+
     std::signal(SIGINT, OnSignal);
     std::signal(SIGTERM, OnSignal);
 
