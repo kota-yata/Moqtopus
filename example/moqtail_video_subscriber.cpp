@@ -21,11 +21,6 @@ namespace
 
     std::atomic_bool interrupted{false};
 
-    void OnSignal(int)
-    {
-        interrupted.store(true);
-    }
-
     const char *DeliveryName(moq::DeliveryKind delivery)
     {
         switch (delivery)
@@ -113,9 +108,6 @@ int main()
 {
     spdlog::set_level(spdlog::level::debug);
 
-    std::signal(SIGINT, OnSignal);
-    std::signal(SIGTERM, OnSignal);
-
     try
     {
         moq::MsQuicClientConfig client;
@@ -136,10 +128,6 @@ int main()
         const moq::SubscriptionHandle handle =
             session->subscribe(std::move(subscribe), handler).get();
 
-        std::cout << "subscribed to moqt://" << kHost << ':' << kPort << kPath
-                  << " namespace=" << kNamespace
-                  << " track=" << kTrackName
-                  << " request=" << handle.request_id();
         if (handle.track_alias())
         {
             std::cout << " alias=" << *handle.track_alias();
@@ -151,12 +139,12 @@ int main()
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        session->stop_subscription(handle.request_id()).get();
+        if (!interrupted.load())
+        {
+            session->stop_subscription(handle.request_id()).get();
+        }
         session->close();
 
-        std::cout << "received " << handler->object_count()
-                  << " objects and " << handler->total_payload_bytes()
-                  << " payload bytes\n";
         return 0;
     }
     catch (const std::exception &error)
