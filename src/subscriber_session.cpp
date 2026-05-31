@@ -241,7 +241,7 @@ namespace moq::detail
             std::future<void> future = promise->get_future();
             executor_.post([this, error, promise]
                            {
-            begin_close(static_cast<uint64_t>(error), "local close");
+            begin_close(error, "local close");
             promise->set_value(); });
             future.wait();
         }
