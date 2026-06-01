@@ -1,7 +1,9 @@
 #include "moq/codec.h"
 
 #include "codec/internal.h"
+#include "spdlog/spdlog.h"
 
+#include <fmt/ranges.h>
 #include <stdexcept>
 
 namespace moq::codec {
@@ -10,6 +12,8 @@ ByteBuffer encode_subscribe(RequestId request_id, const SubscribeRequest &reques
   ByteBuffer payload;
   write_varint(payload, request_id);
   write_track_namespace(payload, request.track_namespace);
+  spdlog::debug("Encoding SUBSCRIBE for track namespace [{}] and track name '{}'",
+                fmt::join(request.track_namespace, ","), request.track_name);
   write_varint(payload, request.track_name.size());
   internal::append_bytes(payload, request.track_name);
   if (!internal::encode_parameters(payload, request.parameters)) {

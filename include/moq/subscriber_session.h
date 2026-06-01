@@ -32,7 +32,6 @@ struct SubscriberConfig {
   UnknownAliasPolicy unknown_alias_policy = UnknownAliasPolicy::BufferDatagrams;
   size_t max_buffered_datagrams_per_alias = 16;
   size_t max_buffered_datagram_bytes = 256 * 1024;
-  bool allow_explicit_request_ids = false;
 };
 
 namespace detail {

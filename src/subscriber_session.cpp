@@ -181,14 +181,105 @@ public:
   std::future<SubscriptionHandle> subscribe(SubscribeRequest request, std::shared_ptr<ObjectHandler> handler) {
     auto promise = std::make_shared<std::promise<SubscriptionHandle>>();
     std::future<SubscriptionHandle> future = promise->get_future();
-    subscribe_on_executor(std::move(request), std::move(handler), std::move(promise));
+    if (!handler) {
+      set_exception(promise, "SUBSCRIBE requires an ObjectHandler");
+      return future;
+    }
+    if (phase_ != SessionPhase::Ready) {
+      set_exception(promise, "MOQT session is not ready for SUBSCRIBE");
+      return future;
+    }
+    try {
+      if (request.request_id) {
+        throw std::invalid_argument("explicit SUBSCRIBE Request ID is not allowed");
+      }
+      RequestId request_id = allocate_request_id();
+      auto stream = transport_->open_stream(false);
+      const std::weak_ptr<SessionImpl> weak = weak_from_this();
+
+      // install route callback: if duplicate alias detected, close session
+      auto install_cb = [weak](TrackAlias alias, std::shared_ptr<ReceiveRoute> route) {
+        if (auto active = weak.lock()) {
+          if (!active->data_plane_.install_route(alias, route)) {
+            active->begin_close(SessionCloseErrorCode::DuplicateTrackAlias,
+                                "SUBSCRIBE_OK reused an established Track Alias");
+            return false;
+          }
+          return true;
+        }
+        return false;
+      };
+
+      auto deactivate_cb = [weak](TrackAlias alias) {
+        if (auto active = weak.lock()) {
+          active->data_plane_.deactivate_route(alias);
+        }
+      };
+
+      auto remove_cb = [weak](TrackAlias alias) {
+        if (auto active = weak.lock()) {
+          active->data_plane_.remove_route(alias);
+        }
+      };
+
+      // subscribe result callback: settle promise and refresh snapshots
+      auto subscribe_result_cb = [weak, promise, request_id](std::optional<RequestError> rejected,
+                                                             std::optional<TrackAlias> alias) {
+        if (auto active = weak.lock()) {
+          if (rejected) {
+            set_exception(promise, rejected_exception(*rejected));
+          } else {
+            try {
+              promise->set_value(SubscriptionHandle(request_id, weak));
+            } catch (...) {
+              set_exception(promise, std::current_exception());
+            }
+          }
+          active->refresh_session_snapshot();
+          active->update_subscription_snapshot_from_fsm(request_id);
+        }
+      };
+
+      if (!stream->send(codec::encode_subscribe(request_id, request))) {
+        throw std::runtime_error("StreamSend failed for SUBSCRIBE");
+      }
+
+      auto fsm = std::make_shared<SubscriptionFSM>(request_id, std::move(request), std::move(handler), stream,
+                                                   std::move(install_cb), std::move(deactivate_cb),
+                                                   std::move(remove_cb), std::move(subscribe_result_cb));
+
+      // wire transport stream callbacks into FSM
+      stream->on_bytes([fsm](ByteBuffer bytes, bool fin) mutable { fsm->on_bytes(std::move(bytes), fin); });
+      stream->on_peer_send_aborted([fsm](uint64_t error_code) mutable { fsm->on_peer_send_aborted(error_code); });
+      stream->on_shutdown([fsm] { fsm->on_shutdown(); });
+
+      subscriptions_.emplace(request_id, fsm);
+      update_subscription_snapshot_from_fsm(request_id);
+      refresh_session_snapshot();
+    } catch (...) {
+      set_exception(promise, std::current_exception());
+    }
     return future;
   }
 
   std::future<RequestOk> request_update(RequestId existing_request_id, RequestUpdate update) {
     auto promise = std::make_shared<std::promise<RequestOk>>();
     std::future<RequestOk> future = promise->get_future();
-    request_update_on_executor(existing_request_id, std::move(update), std::move(promise));
+    const auto found = subscriptions_.find(existing_request_id);
+    if (found == subscriptions_.end() || found->second->phase() != moq::SubscriptionPhase::Established) {
+      set_exception(promise, "REQUEST_UPDATE requires an established subscription");
+      return future;
+    }
+    auto fsm = found->second;
+    try {
+      RequestId request_id = allocate_request_id();
+      auto stream = fsm->stream();
+      auto sender = [stream](ByteBuffer bytes) { return stream->send(std::move(bytes)); };
+      fsm->send_request_update(request_id, std::move(update), promise, sender);
+      update_subscription_snapshot_from_fsm(existing_request_id);
+    } catch (...) {
+      set_exception(promise, std::current_exception());
+    }
     return future;
   }
 
@@ -288,120 +379,8 @@ private:
     if (request_id > std::numeric_limits<RequestId>::max() - 2) {
       throw std::overflow_error("MOQT Request ID space exhausted");
     }
-    next_request_id_ += 2;
+    next_request_id_ += 2; // client uses even Request IDs, server uses odd Request IDs
     return request_id;
-  }
-
-  void subscribe_on_executor(SubscribeRequest request, std::shared_ptr<ObjectHandler> handler,
-                             std::shared_ptr<std::promise<SubscriptionHandle>> promise) {
-    if (!handler) {
-      set_exception(promise, "SUBSCRIBE requires an ObjectHandler");
-      return;
-    }
-    if (phase_ != SessionPhase::Ready) {
-      set_exception(promise, "MOQT session is not ready for SUBSCRIBE");
-      return;
-    }
-    try {
-      RequestId request_id = 0;
-      if (request.request_id) {
-        if (!subscriber_config_.allow_explicit_request_ids || (*request.request_id & 1U) != 0 ||
-            subscriptions_.find(*request.request_id) != subscriptions_.end()) {
-          throw std::invalid_argument("explicit SUBSCRIBE Request ID is not allowed");
-        }
-        request_id = *request.request_id;
-        if (request_id >= next_request_id_) {
-          if (request_id > std::numeric_limits<RequestId>::max() - 2) {
-            throw std::overflow_error("MOQT Request ID space exhausted");
-          }
-          next_request_id_ = request_id + 2;
-        }
-      } else {
-        request_id = allocate_request_id();
-      }
-      auto stream = transport_->open_stream(false);
-      const std::weak_ptr<SessionImpl> weak = weak_from_this();
-
-      // install route callback: if duplicate alias detected, close session
-      auto install_cb = [weak](TrackAlias alias, std::shared_ptr<ReceiveRoute> route) {
-        if (auto active = weak.lock()) {
-          if (!active->data_plane_.install_route(alias, route)) {
-            active->begin_close(SessionCloseErrorCode::DuplicateTrackAlias,
-                                "SUBSCRIBE_OK reused an established Track Alias");
-            return false;
-          }
-          return true;
-        }
-        return false;
-      };
-
-      auto deactivate_cb = [weak](TrackAlias alias) {
-        if (auto active = weak.lock()) {
-          active->data_plane_.deactivate_route(alias);
-        }
-      };
-
-      auto remove_cb = [weak](TrackAlias alias) {
-        if (auto active = weak.lock()) {
-          active->data_plane_.remove_route(alias);
-        }
-      };
-
-      // subscribe result callback: settle promise and refresh snapshots
-      auto subscribe_result_cb = [weak, promise, request_id](std::optional<RequestError> rejected,
-                                                             std::optional<TrackAlias> alias) {
-        if (auto active = weak.lock()) {
-          if (rejected) {
-            set_exception(promise, rejected_exception(*rejected));
-          } else {
-            try {
-              promise->set_value(SubscriptionHandle(request_id, weak));
-            } catch (...) {
-              set_exception(promise, std::current_exception());
-            }
-          }
-          active->refresh_session_snapshot();
-          active->update_subscription_snapshot_from_fsm(request_id);
-        }
-      };
-
-      auto fsm = std::make_shared<SubscriptionFSM>(request_id, std::move(request), std::move(handler), stream,
-                                                   std::move(install_cb), std::move(deactivate_cb),
-                                                   std::move(remove_cb), std::move(subscribe_result_cb));
-
-      // wire transport stream callbacks into FSM
-      stream->on_bytes([fsm](ByteBuffer bytes, bool fin) mutable { fsm->on_bytes(std::move(bytes), fin); });
-      stream->on_peer_send_aborted([fsm](uint64_t error_code) mutable { fsm->on_peer_send_aborted(error_code); });
-      stream->on_shutdown([fsm] { fsm->on_shutdown(); });
-
-      subscriptions_.emplace(request_id, fsm);
-      update_subscription_snapshot_from_fsm(request_id);
-      refresh_session_snapshot();
-      if (!stream->send(codec::encode_subscribe(request_id, request))) {
-        throw std::runtime_error("StreamSend failed for SUBSCRIBE");
-      }
-    } catch (...) {
-      set_exception(promise, std::current_exception());
-    }
-  }
-
-  void request_update_on_executor(RequestId existing_request_id, RequestUpdate update,
-                                  std::shared_ptr<std::promise<RequestOk>> promise) {
-    const auto found = subscriptions_.find(existing_request_id);
-    if (found == subscriptions_.end() || found->second->phase() != moq::SubscriptionPhase::Established) {
-      set_exception(promise, "REQUEST_UPDATE requires an established subscription");
-      return;
-    }
-    auto fsm = found->second;
-    try {
-      RequestId request_id = allocate_request_id();
-      auto stream = fsm->stream();
-      auto sender = [stream](ByteBuffer bytes) { return stream->send(std::move(bytes)); };
-      fsm->send_request_update(request_id, std::move(update), promise, sender);
-      update_subscription_snapshot_from_fsm(existing_request_id);
-    } catch (...) {
-      set_exception(promise, std::current_exception());
-    }
   }
 
   void on_subscription_bytes(RequestId request_id, ByteBuffer bytes, bool fin) {

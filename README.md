@@ -18,8 +18,7 @@ cmake --build build --target moqtail_video_subscriber
 ./build/moqtail_video_subscriber
 ```
 
-It prints received object metadata and payload sizes until the publisher
-finishes or you stop it with `Ctrl-C`.
+It prints received object metadata and payload sizes.
 
 The generic subscriber executable accepts connection details on the command
 line:
