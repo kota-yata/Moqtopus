@@ -15,6 +15,7 @@ class MsQuicTransportAdapter;
 
 class StreamContext : public std::enable_shared_from_this<StreamContext> {
 public:
+  // generic callback types
   using BytesCallback = std::function<void(ByteBuffer, bool)>;
   using ErrorCallback = std::function<void(uint64_t)>;
   using ShutdownCallback = std::function<void()>;
