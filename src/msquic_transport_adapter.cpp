@@ -40,12 +40,6 @@ std::string status_to_string(QUIC_STATUS status) {
   }
 }
 
-std::string status_message(const char *operation, QUIC_STATUS status) {
-  std::ostringstream message;
-  message << operation << " failed with status " << status_to_string(status) << " (0x" << std::hex << status << ")";
-  return message.str();
-}
-
 ByteBuffer copy_buffers(const QUIC_BUFFER *buffers, uint32_t count) {
   ByteBuffer bytes;
   size_t total = 0;
@@ -126,7 +120,7 @@ QUIC_STATUS TransportStream::handle_event(HQUIC stream, QUIC_STREAM_EVENT *event
   case QUIC_STREAM_EVENT_START_COMPLETE: {
     set_id(event->START_COMPLETE.ID);
     if (QUIC_FAILED(event->START_COMPLETE.Status)) {
-      const std::string message = status_message("StreamStart", event->START_COMPLETE.Status);
+      const std::string message = std::string("StreamStart failed: ") + status_to_string(event->START_COMPLETE.Status);
       adapter_.callbacks_.transport_error(message);
     }
     break;
@@ -177,7 +171,7 @@ MsQuicTransportAdapter::MsQuicTransportAdapter(MsQuicClientConfig config, Callba
     : config_(std::move(config)), callbacks_(std::move(callbacks)) {
   QUIC_STATUS status = MsQuicOpen2(&api_);
   if (QUIC_FAILED(status)) {
-    throw std::runtime_error(status_message("MsQuicOpen2", status));
+    throw std::runtime_error(std::string("MsQuicOpen2 failed: ") + status_to_string(status));
   }
 
   QUIC_REGISTRATION_CONFIG registration_config{};
@@ -185,7 +179,7 @@ MsQuicTransportAdapter::MsQuicTransportAdapter(MsQuicClientConfig config, Callba
   registration_config.ExecutionProfile = QUIC_EXECUTION_PROFILE_LOW_LATENCY;
   status = api_->RegistrationOpen(&registration_config, &registration_);
   if (QUIC_FAILED(status)) {
-    throw std::runtime_error(status_message("RegistrationOpen", status));
+    throw std::runtime_error(std::string("RegistrationOpen failed: ") + status_to_string(status));
   }
 
   QUIC_BUFFER alpn{};
@@ -204,7 +198,7 @@ MsQuicTransportAdapter::MsQuicTransportAdapter(MsQuicClientConfig config, Callba
 
   status = api_->ConfigurationOpen(registration_, &alpn, 1, &settings, sizeof(settings), nullptr, &configuration_);
   if (QUIC_FAILED(status)) {
-    throw std::runtime_error(status_message("ConfigurationOpen", status));
+    throw std::runtime_error(std::string("ConfigurationOpen failed: ") + status_to_string(status));
   }
 
   QUIC_CREDENTIAL_CONFIG credential{};
@@ -215,12 +209,12 @@ MsQuicTransportAdapter::MsQuicTransportAdapter(MsQuicClientConfig config, Callba
   }
   status = api_->ConfigurationLoadCredential(configuration_, &credential);
   if (QUIC_FAILED(status)) {
-    throw std::runtime_error(status_message("ConfigurationLoadCredential", status));
+    throw std::runtime_error(std::string("ConfigurationLoadCredential failed: ") + status_to_string(status));
   }
 
   status = api_->ConnectionOpen(registration_, connection_callback, this, &connection_);
   if (QUIC_FAILED(status)) {
-    throw std::runtime_error(status_message("ConnectionOpen", status));
+    throw std::runtime_error(std::string("ConnectionOpen failed: ") + status_to_string(status));
   }
 }
 
@@ -260,7 +254,7 @@ void MsQuicTransportAdapter::start() {
   const QUIC_STATUS status = api_->ConnectionStart(connection_, configuration_, QUIC_ADDRESS_FAMILY_UNSPEC,
                                                    config_.host.c_str(), config_.port);
   if (QUIC_FAILED(status)) {
-    throw std::runtime_error(status_message("ConnectionStart", status));
+    throw std::runtime_error(std::string("ConnectionStart failed: ") + status_to_string(status));
   }
   started_ = true;
 }
@@ -271,7 +265,7 @@ std::shared_ptr<TransportStream> MsQuicTransportAdapter::open_stream(bool unidir
       unidirectional ? QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL : QUIC_STREAM_OPEN_FLAG_NONE;
   QUIC_STATUS status = api_->StreamOpen(connection_, open_flags, TransportStream::stream_callback, nullptr, &handle);
   if (QUIC_FAILED(status)) {
-    throw std::runtime_error(status_message("StreamOpen", status));
+    throw std::runtime_error(std::string("StreamOpen failed: ") + status_to_string(status));
   }
 
   auto stream = std::shared_ptr<TransportStream>(new TransportStream(*this, handle, unidirectional));
@@ -285,7 +279,7 @@ std::shared_ptr<TransportStream> MsQuicTransportAdapter::open_stream(bool unidir
     remove_stream(stream.get());
     api_->StreamClose(handle);
     stream->handle_ = nullptr;
-    throw std::runtime_error(status_message("StreamStart", status));
+    throw std::runtime_error(std::string("StreamStart failed: ") + status_to_string(status));
   }
   return stream;
 }
