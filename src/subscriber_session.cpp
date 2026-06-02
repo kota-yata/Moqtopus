@@ -21,6 +21,24 @@
 namespace moq::detail {
 namespace {
 
+template <typename T> void set_exception(std::promise<T> &promise, const std::string &message) {
+  try {
+    throw std::runtime_error(message);
+  } catch (...) {
+    try {
+      promise.set_exception(std::current_exception());
+    } catch (const std::future_error &) {
+    }
+  }
+}
+
+template <typename T> void set_exception(std::promise<T> &promise, std::exception_ptr exception) {
+  try {
+    promise.set_exception(std::move(exception));
+  } catch (const std::future_error &) {
+  }
+}
+
 template <typename T> void set_exception(const std::shared_ptr<std::promise<T>> &promise, const std::string &message) {
   try {
     throw std::runtime_error(message);
@@ -147,17 +165,17 @@ public:
 
   // waits until session is either ready or closed
   std::future<void> ready() {
-    auto promise = std::make_shared<std::promise<void>>();
-    std::future<void> future = promise->get_future();
+    std::promise<void> promise;
+    std::future<void> future = promise.get_future();
     if (phase_ == SessionPhase::Ready || phase_ == SessionPhase::Draining) {
-      promise->set_value();
+      promise.set_value();
       return future;
     }
     if (phase_ == SessionPhase::Closing || phase_ == SessionPhase::Closed) {
       set_exception(promise, "MOQT session closed before SETUP completed");
       return future;
     }
-    ready_waiters_.push_back(promise);
+    ready_waiters_.push_back(std::move(promise));
     return future;
   }
 
@@ -263,8 +281,8 @@ public:
   }
 
   std::future<RequestOk> request_update(RequestId existing_request_id, RequestUpdate update) {
-    auto promise = std::make_shared<std::promise<RequestOk>>();
-    std::future<RequestOk> future = promise->get_future();
+    std::promise<RequestOk> promise;
+    std::future<RequestOk> future = promise.get_future();
     const auto found = subscriptions_.find(existing_request_id);
     if (found == subscriptions_.end() || found->second->phase() != moq::SubscriptionPhase::Established) {
       set_exception(promise, "REQUEST_UPDATE requires an established subscription");
@@ -275,7 +293,7 @@ public:
       RequestId request_id = allocate_request_id();
       auto stream = fsm->stream();
       auto sender = [stream](ByteBuffer bytes) { return stream->send(std::move(bytes)); };
-      fsm->send_request_update(request_id, std::move(update), promise, sender);
+      fsm->send_request_update(request_id, std::move(update), std::move(promise), sender);
       update_subscription_snapshot_from_fsm(existing_request_id);
     } catch (...) {
       set_exception(promise, std::current_exception());
@@ -338,8 +356,7 @@ private:
   }
 
   void start_padding_stream(const std::shared_ptr<StreamContext> &stream, ByteBuffer initial, size_t type_bytes) {
-    if (!std::all_of(initial.begin() + static_cast<std::ptrdiff_t>(type_bytes), initial.end(),
-                     [](uint8_t byte) { return byte == 0; })) {
+    if (!std::all_of(initial.begin() + type_bytes, initial.end(), [](uint8_t byte) { return byte == 0; })) {
       protocol_violation("padding stream contains non-zero bytes");
       return;
     }
@@ -367,8 +384,8 @@ private:
     }
     spdlog::debug("MOQT SETUP completed; session ready");
     phase_ = SessionPhase::Ready;
-    for (const auto &waiter : ready_waiters_) {
-      waiter->set_value();
+    for (auto &waiter : ready_waiters_) {
+      waiter.set_value();
     }
     ready_waiters_.clear();
     refresh_session_snapshot();
@@ -478,7 +495,7 @@ private:
   }
 
   void fail_ready_waiters(const std::string &reason) {
-    for (const auto &waiter : ready_waiters_) {
+    for (auto &waiter : ready_waiters_) {
       set_exception(waiter, reason);
     }
     ready_waiters_.clear();
@@ -529,7 +546,7 @@ private:
   bool peer_setup_received_ = false;
   std::optional<SessionCloseReason> close_reason_;
   std::shared_ptr<StreamContext> local_setup_stream_;
-  std::vector<std::shared_ptr<std::promise<void>>> ready_waiters_;
+  std::vector<std::promise<void>> ready_waiters_;
   std::unordered_map<RequestId, std::shared_ptr<SubscriptionFSM>> subscriptions_;
 
   mutable std::mutex snapshot_mutex_;

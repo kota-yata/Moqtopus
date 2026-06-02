@@ -21,7 +21,7 @@ class SubscriptionFSM {
 public:
   struct PendingUpdate {
     RequestId request_id = 0;
-    std::shared_ptr<std::promise<RequestOk>> promise;
+    std::promise<RequestOk> promise;
   };
 
   using InstallRouteCb = std::function<bool(TrackAlias, std::shared_ptr<ReceiveRoute>)>;
@@ -46,7 +46,7 @@ public:
 
   // Enqueue a request-update to be sent on this stream. Returns the generated id.
   RequestId send_request_update(RequestId allocated_request_id, RequestUpdate update,
-                                std::shared_ptr<std::promise<RequestOk>> promise,
+                                std::promise<RequestOk> promise,
                                 std::function<bool(ByteBuffer)> sender);
 
   // Stop the subscription and optionally report error to handler.

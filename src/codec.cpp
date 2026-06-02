@@ -420,8 +420,7 @@ ControlMessageResult read_control_message(const ByteBuffer &bytes, size_t offset
 
   ControlMessage message;
   message.type = type.value;
-  message.payload.assign(bytes.begin() + static_cast<std::ptrdiff_t>(length_offset + 2),
-                         bytes.begin() + static_cast<std::ptrdiff_t>(length_offset + 2 + length));
+  message.payload.assign(bytes.begin() + (length_offset + 2), bytes.begin() + (length_offset + 2 + length));
   return ControlMessageResult{DecodeStatus::Done, std::move(message), frame_size, {}};
 }
 

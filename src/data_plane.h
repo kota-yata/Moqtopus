@@ -28,7 +28,7 @@ struct ReceiveRoute {
   TrackAlias track_alias = 0;
   std::atomic_bool active{true};
   std::shared_ptr<ObjectHandler> handler;
-  std::shared_ptr<TrackReceiveValidation> validation = std::make_shared<TrackReceiveValidation>();
+  TrackReceiveValidation validation;
   std::atomic<uint8_t> default_publisher_priority{128};
   std::atomic<uint64_t> received_stream_count{0};
   std::atomic<uint64_t> expected_stream_count{0};

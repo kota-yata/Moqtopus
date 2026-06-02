@@ -18,7 +18,7 @@ std::optional<SubscribeOk> decode_subscribe_ok(const ByteBuffer &payload, std::s
     }
     return std::nullopt;
   }
-  ok.track_properties.assign(payload.begin() + static_cast<std::ptrdiff_t>(cursor.offset), payload.end());
+  ok.track_properties.assign(payload.begin() + cursor.offset, payload.end());
   return ok;
 }
 

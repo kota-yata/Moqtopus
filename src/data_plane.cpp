@@ -234,9 +234,8 @@ private:
       if (payload_length > buffer_.size() - offset) {
         return ParseResult{ParseStatus::NeedMore, {}};
       }
-      payload.assign(buffer_.begin() + static_cast<std::ptrdiff_t>(offset),
-                     buffer_.begin() + static_cast<std::ptrdiff_t>(offset + payload_length));
-      offset += static_cast<size_t>(payload_length);
+      payload.assign(buffer_.begin() + offset, buffer_.begin() + (offset + payload_length));
+      offset += payload_length;
     }
 
     ObjectId object_id = object_delta;
@@ -281,7 +280,7 @@ private:
   void close_cleanly() {
     closed_ = true;
     if (route_ && end_of_group_on_fin_ && last_object_id_) {
-      route_->validation->mark_final_object_in_group(group_id_, *last_object_id_);
+      route_->validation.mark_final_object_in_group(group_id_, *last_object_id_);
     }
   }
 
@@ -446,7 +445,7 @@ void DataPlane::deliver_datagram(ByteBuffer bytes, bool allow_buffer) {
     }
     object_status = status_code;
   } else {
-    payload.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.end());
+    payload.assign(bytes.begin() + offset, bytes.end());
   }
 
   Object object;
@@ -460,7 +459,7 @@ void DataPlane::deliver_datagram(ByteBuffer bytes, bool allow_buffer) {
   object.payload = std::move(payload);
   object.delivery_kind = DeliveryKind::Datagram;
   if ((type & 0x02) != 0) {
-    route->validation->mark_final_object_in_group(group, object_id);
+    route->validation.mark_final_object_in_group(group, object_id);
   }
   deliver(route, std::move(object));
 }
@@ -492,15 +491,15 @@ void DataPlane::deliver(std::shared_ptr<ReceiveRoute> route, Object object) {
     return;
   }
   std::string error;
-  if (!route->validation->validate(object, error)) {
+  if (!route->validation.validate(object, error)) {
     track_error(route->request_id, std::move(error));
     return;
   }
   if (object.status && *object.status == kEndOfGroupStatus) {
-    route->validation->mark_final_object_in_group(object.group_id, object.object_id);
+    route->validation.mark_final_object_in_group(object.group_id, object.object_id);
   }
   if (object.status && *object.status == kEndOfTrackStatus) {
-    route->validation->mark_final_object_in_track(Location{object.group_id, object.object_id});
+    route->validation.mark_final_object_in_track(Location{object.group_id, object.object_id});
   }
   route->handler->on_object(std::move(object));
 }

@@ -18,7 +18,7 @@ std::optional<RequestOk> decode_request_ok(const ByteBuffer &payload, std::strin
     }
     return std::nullopt;
   }
-  ok.track_properties.assign(payload.begin() + static_cast<std::ptrdiff_t>(cursor.offset), payload.end());
+  ok.track_properties.assign(payload.begin() + cursor.offset, payload.end());
   return ok;
 }
 

@@ -10,6 +10,7 @@
 
 namespace moq::detail {
 
+// including msquic_transport_adapter.h will cause circular dependency, so forward declare here
 class MsQuicTransportAdapter;
 
 class StreamContext : public std::enable_shared_from_this<StreamContext> {

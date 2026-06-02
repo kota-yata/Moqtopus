@@ -28,8 +28,7 @@ void SubscriptionFSM::on_bytes(ByteBuffer bytes, bool fin) {
     if (parsed.status != codec::DecodeStatus::Done) {
       break;
     }
-    response_buffer_.erase(response_buffer_.begin(),
-                           response_buffer_.begin() + static_cast<std::ptrdiff_t>(parsed.bytes));
+    response_buffer_.erase(response_buffer_.begin(), response_buffer_.begin() + parsed.bytes);
     handle_control_message(parsed.message);
     if (phase_ == moq::SubscriptionPhase::Terminated) {
       return;
@@ -49,11 +48,11 @@ void SubscriptionFSM::on_peer_send_aborted(uint64_t error_code) {
 void SubscriptionFSM::on_shutdown() { terminate(true, "request stream shut down before subscription ended"); }
 
 RequestId SubscriptionFSM::send_request_update(RequestId allocated_request_id, RequestUpdate update,
-                                               std::shared_ptr<std::promise<RequestOk>> promise,
+                                               std::promise<RequestOk> promise,
                                                std::function<bool(ByteBuffer)> sender) {
   PendingUpdate pending;
   pending.request_id = allocated_request_id;
-  pending.promise = promise;
+  pending.promise = std::move(promise);
   // encode and send via provided sender; failure should surface to caller
   if (!sender(codec::encode_request_update(allocated_request_id, update))) {
     throw std::runtime_error("StreamSend failed for REQUEST_UPDATE");
@@ -76,7 +75,7 @@ void SubscriptionFSM::terminate(bool report_error, std::string reason) {
       throw std::runtime_error(reason.empty() ? "subscription terminated before REQUEST_UPDATE completed" : reason);
     } catch (...) {
       try {
-        pending.promise->set_exception(std::current_exception());
+        pending.promise.set_exception(std::current_exception());
       } catch (const std::future_error &) {
       }
     }
@@ -191,7 +190,7 @@ void SubscriptionFSM::accept_request_ok(const codec::ControlMessage &message) {
   PendingUpdate pending = std::move(updates_.front());
   updates_.pop_front();
   try {
-    pending.promise->set_value(*ok);
+    pending.promise.set_value(*ok);
   } catch (...) {
   }
 }
@@ -212,7 +211,7 @@ void SubscriptionFSM::reject_request_update(const codec::ControlMessage &message
     PendingUpdate pending = std::move(updates_.front());
     updates_.pop_front();
     try {
-      pending.promise->set_exception(exception);
+      pending.promise.set_exception(exception);
     } catch (...) {
     }
   }
