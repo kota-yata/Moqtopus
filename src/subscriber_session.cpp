@@ -91,7 +91,7 @@ public:
   void start() {
     MsQuicTransportAdapter::Callbacks callbacks;
     callbacks.connected = [this] { on_connected(); };
-    callbacks.peer_stream_started = [this](std::shared_ptr<TransportStream> stream) {
+    callbacks.peer_stream_started = [this](std::shared_ptr<StreamContext> stream) {
       on_peer_stream_started(std::move(stream));
     };
     callbacks.datagram_received = [this](ByteBuffer bytes) { data_plane_.on_datagram(std::move(bytes)); };
@@ -106,19 +106,19 @@ public:
         active->handle_peer_setup(std::move(setup));
       }
     };
-    peer_demux_callbacks_uni_.on_subgroup = [weak](std::shared_ptr<TransportStream> peer_stream, ByteBuffer initial,
+    peer_demux_callbacks_uni_.on_subgroup = [weak](std::shared_ptr<StreamContext> peer_stream, ByteBuffer initial,
                                                    bool fin) mutable {
       if (auto active = weak.lock()) {
         active->data_plane_.start_subgroup_stream(std::move(peer_stream), std::move(initial), fin);
       }
     };
-    peer_demux_callbacks_uni_.on_padding = [weak](std::shared_ptr<TransportStream> peer_stream, ByteBuffer initial,
+    peer_demux_callbacks_uni_.on_padding = [weak](std::shared_ptr<StreamContext> peer_stream, ByteBuffer initial,
                                                   size_t type_bytes) mutable {
       if (auto active = weak.lock()) {
         active->start_padding_stream(std::move(peer_stream), std::move(initial), type_bytes);
       }
     };
-    peer_demux_callbacks_uni_.on_fetch = [](std::shared_ptr<TransportStream> peer_stream) mutable {
+    peer_demux_callbacks_uni_.on_fetch = [](std::shared_ptr<StreamContext> peer_stream) mutable {
       if (peer_stream) {
         peer_stream->abort_receive(0);
       }
@@ -130,7 +130,7 @@ public:
     };
     peer_demux_callbacks_bidi_.on_protocol_violation = peer_demux_callbacks_uni_.on_protocol_violation;
     peer_demux_callbacks_bidi_.on_request = [weak](uint64_t request_type,
-                                                   std::shared_ptr<TransportStream> peer_stream) mutable {
+                                                   std::shared_ptr<StreamContext> peer_stream) mutable {
       if (auto active = weak.lock()) {
         if (!known_peer_request_type(request_type)) {
           active->protocol_violation("unknown peer request type " + std::to_string(request_type));
@@ -323,7 +323,7 @@ private:
     }
   }
 
-  void on_peer_stream_started(std::shared_ptr<TransportStream> stream) {
+  void on_peer_stream_started(std::shared_ptr<StreamContext> stream) {
     if (stream->unidirectional()) {
       spdlog::debug("Peer started a unidirectional stream (id={})", stream->id());
       // It could be unidirectional control streams (SETUP or GOAWAY) or subgroup/padding/fetch streams.
@@ -337,7 +337,7 @@ private:
     stream->on_bytes([demux](ByteBuffer bytes, bool fin) mutable { demux->feed(std::move(bytes), fin); });
   }
 
-  void start_padding_stream(const std::shared_ptr<TransportStream> &stream, ByteBuffer initial, size_t type_bytes) {
+  void start_padding_stream(const std::shared_ptr<StreamContext> &stream, ByteBuffer initial, size_t type_bytes) {
     if (!std::all_of(initial.begin() + static_cast<std::ptrdiff_t>(type_bytes), initial.end(),
                      [](uint8_t byte) { return byte == 0; })) {
       protocol_violation("padding stream contains non-zero bytes");
@@ -528,7 +528,7 @@ private:
   bool local_setup_sent_ = false;
   bool peer_setup_received_ = false;
   std::optional<SessionCloseReason> close_reason_;
-  std::shared_ptr<TransportStream> local_setup_stream_;
+  std::shared_ptr<StreamContext> local_setup_stream_;
   std::vector<std::shared_ptr<std::promise<void>>> ready_waiters_;
   std::unordered_map<RequestId, std::shared_ptr<SubscriptionFSM>> subscriptions_;
 

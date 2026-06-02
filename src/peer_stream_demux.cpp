@@ -12,7 +12,7 @@ uint16_t read_u16(const ByteBuffer &bytes, size_t offset) {
 
 } // namespace
 
-PeerUniDemux::PeerUniDemux(std::shared_ptr<TransportStream> stream, SessionCallbacks callbacks)
+PeerUniDemux::PeerUniDemux(std::shared_ptr<StreamContext> stream, SessionCallbacks callbacks)
     : stream_(std::move(stream)), on_setup_(std::move(callbacks.on_setup)),
       on_subgroup_(std::move(callbacks.on_subgroup)), on_padding_(std::move(callbacks.on_padding)),
       on_fetch_(std::move(callbacks.on_fetch)), on_protocol_violation_(std::move(callbacks.on_protocol_violation)) {}
@@ -30,7 +30,7 @@ void PeerUniDemux::feed(ByteBuffer input, bool fin) {
     return;
   }
 
-  const std::shared_ptr<TransportStream> stream = stream_.lock();
+  const std::shared_ptr<StreamContext> stream = stream_.lock();
   if (!stream) {
     return;
   }
@@ -87,7 +87,7 @@ void PeerUniDemux::feed(ByteBuffer input, bool fin) {
   }
 }
 
-PeerBidiDemux::PeerBidiDemux(std::shared_ptr<TransportStream> stream, SessionCallbacksBidi callbacks)
+PeerBidiDemux::PeerBidiDemux(std::shared_ptr<StreamContext> stream, SessionCallbacksBidi callbacks)
     : stream_(std::move(stream)), on_request_(std::move(callbacks.on_request)),
       on_protocol_violation_(std::move(callbacks.on_protocol_violation)) {}
 
@@ -102,7 +102,7 @@ void PeerBidiDemux::feed(ByteBuffer input, bool fin) {
     return;
   }
 
-  const std::shared_ptr<TransportStream> stream = stream_.lock();
+  const std::shared_ptr<StreamContext> stream = stream_.lock();
   if (!stream) {
     return;
   }

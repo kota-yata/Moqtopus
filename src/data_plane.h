@@ -1,7 +1,7 @@
 #pragma once
 
 #include "moq/subscriber_session.h"
-#include "msquic_transport_adapter.h"
+#include "stream_context.h"
 
 #include <atomic>
 #include <functional>
@@ -47,7 +47,7 @@ public:
   std::shared_ptr<ReceiveRoute> find_route(TrackAlias alias) const;
 
   void on_datagram(ByteBuffer bytes);
-  void start_subgroup_stream(std::shared_ptr<TransportStream> stream, ByteBuffer initial_bytes, bool fin);
+  void start_subgroup_stream(std::shared_ptr<StreamContext> stream, ByteBuffer initial_bytes, bool fin);
 
   UnknownAliasPolicy unknown_alias_policy() const;
   void deliver(std::shared_ptr<ReceiveRoute> route, Object object);

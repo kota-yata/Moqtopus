@@ -12,7 +12,7 @@ static std::exception_ptr rejected_exception(const RequestError &error) {
 }
 
 SubscriptionFSM::SubscriptionFSM(RequestId request_id, SubscribeRequest request, std::shared_ptr<ObjectHandler> handler,
-                                 std::shared_ptr<TransportStream> stream, InstallRouteCb install_cb,
+                                 std::shared_ptr<StreamContext> stream, InstallRouteCb install_cb,
                                  DeactivateRouteCb deactivate_cb, RemoveRouteCb remove_cb,
                                  SubscribeResultCb subscribe_result_cb)
     : request_id_(request_id), request_(std::move(request)), stream_(std::move(stream)), handler_(std::move(handler)),

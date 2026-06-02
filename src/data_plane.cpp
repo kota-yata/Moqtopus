@@ -79,7 +79,7 @@ bool all_zero_after(const ByteBuffer &bytes, size_t offset) {
 
 class DataStreamReceiver : public std::enable_shared_from_this<DataStreamReceiver> {
 public:
-  DataStreamReceiver(DataPlane &plane, std::shared_ptr<TransportStream> stream)
+  DataStreamReceiver(DataPlane &plane, std::shared_ptr<StreamContext> stream)
       : plane_(plane), stream_(std::move(stream)) {}
 
   void feed(ByteBuffer bytes, bool fin) {
@@ -286,7 +286,7 @@ private:
   }
 
   DataPlane &plane_;
-  std::shared_ptr<TransportStream> stream_;
+  std::shared_ptr<StreamContext> stream_;
   ByteBuffer buffer_;
   std::shared_ptr<ReceiveRoute> route_;
   bool header_done_ = false;
@@ -367,7 +367,7 @@ std::shared_ptr<ReceiveRoute> DataPlane::find_route(TrackAlias alias) const {
 
 void DataPlane::on_datagram(ByteBuffer bytes) { deliver_datagram(std::move(bytes), true); }
 
-void DataPlane::start_subgroup_stream(std::shared_ptr<TransportStream> stream, ByteBuffer initial_bytes, bool fin) {
+void DataPlane::start_subgroup_stream(std::shared_ptr<StreamContext> stream, ByteBuffer initial_bytes, bool fin) {
   auto receiver = std::make_shared<DataStreamReceiver>(*this, stream);
   stream->on_bytes(
       [receiver](ByteBuffer bytes, bool bytes_fin) mutable { receiver->feed(std::move(bytes), bytes_fin); });
