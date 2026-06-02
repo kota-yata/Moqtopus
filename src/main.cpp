@@ -15,10 +15,6 @@
 
 namespace {
 
-std::atomic_bool interrupted{false};
-
-void OnSignal(int) { interrupted.store(true); }
-
 bool ParsePort(const char *value, uint16_t &port) {
   try {
     const unsigned long parsed = std::stoul(value);
@@ -112,7 +108,11 @@ void Usage(const char *argv0) {
 } // namespace
 
 int main(int argc, char **argv) {
-  spdlog::set_level(spdlog::level::debug);
+  if (const char *env_level = std::getenv("LOG_LEVEL")) {
+    spdlog::set_level(spdlog::level::from_str(env_level));
+  } else {
+    spdlog::set_level(spdlog::level::debug);
+  }
 
   if (argc < 5 || argc > 7) {
     Usage(argv[0]);
@@ -142,12 +142,6 @@ int main(int argc, char **argv) {
       std::cout << " alias=" << *subscription.track_alias();
     }
     std::cout << '\n';
-
-    std::signal(SIGINT, OnSignal);
-    std::signal(SIGTERM, OnSignal);
-    while (!interrupted.load() && !handler->done()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
 
     session->stop_subscription(subscription.request_id()).get();
     session->close();
