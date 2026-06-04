@@ -1,5 +1,5 @@
 # Moqtopus
-MoQ Subscriber API over MsQUIC
+MoQ Subscriber API over MsQUIC. Moqtopus keeps the dependency graph fairly small, which helps a lot when the rest of your application already take a gazillion year building (like UE).
 
 ## Build
 Moqtopus requires [vcpkg](https://github.com/microsoft/vcpkg). Set
