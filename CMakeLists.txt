@@ -25,6 +25,10 @@ target_compile_definitions(moq_subscriber PRIVATE SPDLOG_ACTIVE_LEVEL=SPDLOG_LEV
 add_executable(moqtopus src/main.cpp)
 target_link_libraries(moqtopus PRIVATE moq_subscriber)
 
+# moq-interop-runner compatible test client
+add_executable(moqtopus_interop_client tools/moqtopus_interop_client.cpp)
+target_link_libraries(moqtopus_interop_client PRIVATE moq_subscriber)
+
 # example executable
 add_executable(moqtail_video_subscriber example/moqtail_video_subscriber.cpp)
 target_link_libraries(moqtail_video_subscriber PRIVATE moq_subscriber)
