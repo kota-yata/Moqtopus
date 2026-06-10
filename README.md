@@ -1,5 +1,5 @@
 # Moqtopus
-MoQ Subscriber API over MsQUIC. Moqtopus keeps the dependency graph fairly small, which helps a lot when the rest of your application already take a gazillion year building (like UE).
+MoQ Client API over MsQUIC. Moqtopus keeps the dependency graph fairly small, which helps a lot when the rest of your application already take a gazillion year building (like UE).
 
 ## Build
 Moqtopus requires [vcpkg](https://github.com/microsoft/vcpkg). Set
@@ -13,22 +13,17 @@ cmake --build build
 
 ## Run the Example
 
-```sh
-cmake --build build --target moqtail_video_subscriber
-./build/moqtail_video_subscriber
-```
-
-It prints received object metadata and payload sizes.
-
-The generic subscriber executable accepts connection details on the command
-line:
+The subscriber example accepts connection details on the command line and
+prints received object metadata and a payload preview until the publisher
+finishes or the process receives SIGINT:
 
 ```sh
-./build/moqtopus <host> <port> <namespace[/field...]> <track-name> [path] [alpn]
+cmake --build build --target subscriber
+./build/subscriber <host> <port> <namespace[/field...]> <track-name> [path] [alpn]
 ```
 
 Example:
 
 ```sh
-./build/moqtopus localhost 4433 camera/front video / moqt-18
+./build/subscriber localhost 4433 camera/front video / moqt-18
 ```
