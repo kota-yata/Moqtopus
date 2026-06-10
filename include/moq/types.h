@@ -52,7 +52,7 @@ struct RequestOk {
 };
 
 struct RequestError {
-  uint64_t code = 0;
+  RequestErrorCode code = RequestErrorCode::InternalError;
   uint64_t retry_interval = 0;
   std::string reason;
 };

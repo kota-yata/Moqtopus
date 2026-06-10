@@ -16,6 +16,27 @@ enum class SessionCloseErrorCode : uint64_t {
   KeyValueFormattingError = 0x6,
 };
 
+enum class RequestErrorCode : uint64_t {
+  InternalError = 0x0,
+  Unauthorized = 0x1,
+  Timeout = 0x2,
+  NotSupported = 0x3,
+  MalformedAuthToken = 0x4,
+  ExpiredAuthToken = 0x5,
+  GoingAway = 0x6,
+  ExcessiveLoad = 0x9,
+  DoesNotExist = 0x10,
+  InvalidRange = 0x11,
+  MalformedTrack = 0x12,
+  DuplicateSubscription = 0x19,
+  Uninterested = 0x20,
+  PrefixOverlap = 0x30,
+  NamespaceTooLarge = 0x31,
+  InvalidJoiningRequestId = 0x32,
+  UnsupportedExtension = 0x33,
+  Redirect = 0x34,
+};
+
 struct ReceiveError {
   uint64_t code = 0;
   std::string message;
@@ -28,14 +49,14 @@ public:
 
 class RequestRejected : public std::runtime_error {
 public:
-  RequestRejected(uint64_t code, uint64_t retry_interval, std::string reason);
+  RequestRejected(RequestErrorCode code, uint64_t retry_interval, std::string reason);
 
-  uint64_t code() const noexcept;
+  RequestErrorCode code() const noexcept;
   uint64_t retry_interval() const noexcept;
   const std::string &reason() const noexcept;
 
 private:
-  uint64_t code_;
+  RequestErrorCode code_;
   uint64_t retry_interval_;
   std::string reason_;
 };
