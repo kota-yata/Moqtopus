@@ -45,12 +45,12 @@ Parameter Parameter::track_namespace(uint64_t type, TrackNamespace value) {
   return parameter;
 }
 
-RequestRejected::RequestRejected(uint64_t code, uint64_t retry_interval, std::string reason)
-    : std::runtime_error("MOQT request rejected: code=" + std::to_string(code) +
+RequestRejected::RequestRejected(RequestErrorCode code, uint64_t retry_interval, std::string reason)
+    : std::runtime_error("MOQT request rejected: code=" + std::to_string(static_cast<uint64_t>(code)) +
                          (reason.empty() ? "" : " reason=" + reason)),
       code_(code), retry_interval_(retry_interval), reason_(std::move(reason)) {}
 
-uint64_t RequestRejected::code() const noexcept { return code_; }
+RequestErrorCode RequestRejected::code() const noexcept { return code_; }
 
 uint64_t RequestRejected::retry_interval() const noexcept { return retry_interval_; }
 
@@ -402,11 +402,11 @@ void append_control_message(ByteBuffer &out, uint64_t type, const ByteBuffer &pa
 ControlMessageResult read_control_message(const ByteBuffer &bytes, size_t offset) {
   const VarintResult type = read_varint(bytes, offset);
   if (type.status != DecodeStatus::Done) {
-    spdlog::error("read_control_message failed: byte underflow");
+    spdlog::error("read_control_message failed: byte underflow while reading type");
     return {};
   }
   if (bytes.size() - offset < type.bytes + 2) {
-    spdlog::error("read_control_message failed: byte underflow");
+    spdlog::error("read_control_message failed: byte underflow while reading length");
     return {};
   }
   const size_t length_offset = offset + type.bytes;
@@ -414,7 +414,7 @@ ControlMessageResult read_control_message(const ByteBuffer &bytes, size_t offset
       static_cast<uint16_t>((static_cast<uint16_t>(bytes[length_offset]) << 8) | bytes[length_offset + 1]);
   const size_t frame_size = type.bytes + 2 + length;
   if (bytes.size() - offset < frame_size) {
-    spdlog::error("read_control_message failed: byte underflow");
+    spdlog::error("read_control_message failed: byte underflow while reading frame");
     return {};
   }
 

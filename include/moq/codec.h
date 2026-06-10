@@ -92,7 +92,7 @@ ByteBuffer encode_setup(std::string authority, std::string path);
 std::optional<Setup> decode_setup(const ByteBuffer &payload, std::string &error);
 ByteBuffer encode_subscribe(RequestId request_id, const SubscribeRequest &request);
 ByteBuffer encode_request_update(RequestId request_id, const RequestUpdate &update);
-ByteBuffer encode_request_error(uint64_t code, std::string reason, uint64_t retry_interval = 0);
+ByteBuffer encode_request_error(RequestErrorCode code, std::string reason, uint64_t retry_interval = 0);
 
 std::optional<SubscribeOk> decode_subscribe_ok(const ByteBuffer &payload, std::string &error);
 std::optional<RequestOk> decode_request_ok(const ByteBuffer &payload, std::string &error);
