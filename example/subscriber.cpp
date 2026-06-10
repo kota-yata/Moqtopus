@@ -4,6 +4,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -14,6 +15,10 @@
 #include <thread>
 
 namespace {
+
+std::atomic_bool interrupted{false};
+
+void HandleSignal(int) { interrupted.store(true); }
 
 bool ParsePort(const char *value, uint16_t &port) {
   try {
@@ -46,10 +51,22 @@ moq::TrackNamespace ParseNamespace(const std::string &value) {
   return fields;
 }
 
+const char *DeliveryName(moq::DeliveryKind delivery) {
+  switch (delivery) {
+  case moq::DeliveryKind::SubgroupStream:
+    return "subgroup";
+  case moq::DeliveryKind::Datagram:
+    return "datagram";
+  case moq::DeliveryKind::FetchStream:
+    return "fetch";
+  }
+  return "unknown";
+}
+
 std::string PayloadPreview(const moq::ByteBuffer &payload) {
   std::ostringstream text;
-  const size_t max_bytes = 24;
-  for (size_t index = 0; index < payload.size() && index < max_bytes; ++index) {
+  constexpr size_t kMaxBytes = 24;
+  for (size_t index = 0; index < payload.size() && index < kMaxBytes; ++index) {
     const uint8_t byte = payload[index];
     if (byte >= 0x20 && byte <= 0x7e) {
       text << static_cast<char>(byte);
@@ -58,7 +75,7 @@ std::string PayloadPreview(const moq::ByteBuffer &payload) {
            << std::setfill(' ');
     }
   }
-  if (payload.size() > max_bytes) {
+  if (payload.size() > kMaxBytes) {
     text << "...";
   }
   return text.str();
@@ -67,37 +84,46 @@ std::string PayloadPreview(const moq::ByteBuffer &payload) {
 class PrintingHandler final : public moq::ObjectHandler {
 public:
   void on_object(moq::Object object) override {
-    std::cout << "object request=" << object.request_id << " alias=" << object.track_alias
-              << " group=" << object.group_id << " object=" << object.object_id;
+    const uint64_t object_count = object_count_.fetch_add(1) + 1;
+    total_payload_bytes_.fetch_add(object.payload.size());
+
+    std::cout << "object #" << object_count << " delivery=" << DeliveryName(object.delivery_kind)
+              << " request=" << object.request_id << " alias=" << object.track_alias << " group=" << object.group_id
+              << " object=" << object.object_id;
     if (object.subgroup_id) {
       std::cout << " subgroup=" << *object.subgroup_id;
     }
     if (object.status) {
       std::cout << " status=" << *object.status;
     } else {
-      std::cout << " bytes=" << object.payload.size() << " preview=\"" << PayloadPreview(object.payload) << '"';
+      std::cout << " payload=" << object.payload.size() << " bytes preview=\"" << PayloadPreview(object.payload)
+                << '"';
     }
     std::cout << '\n';
   }
 
   void on_publish_done(moq::PublishDone done) override {
-    std::cout << "publish done status=" << done.status_code << " streams=" << done.stream_count;
+    std::cout << "publisher finished track status=" << done.status_code << " streams=" << done.stream_count;
     if (!done.reason.empty()) {
       std::cout << " reason=\"" << done.reason << '"';
     }
     std::cout << '\n';
-    done_.store(true);
+    stopped_.store(true);
   }
 
   void on_error(moq::ReceiveError error) override {
     spdlog::error("receive error code={} message=\"{}\"", error.code, error.message);
-    done_.store(true);
+    stopped_.store(true);
   }
 
-  bool done() const { return done_.load(); }
+  bool stopped() const { return stopped_.load(); }
+  uint64_t object_count() const { return object_count_.load(); }
+  uint64_t total_payload_bytes() const { return total_payload_bytes_.load(); }
 
 private:
-  std::atomic_bool done_{false};
+  std::atomic_bool stopped_{false};
+  std::atomic_uint64_t object_count_{0};
+  std::atomic_uint64_t total_payload_bytes_{0};
 };
 
 void Usage(const char *argv0) {
@@ -119,6 +145,9 @@ int main(int argc, char **argv) {
     return 2;
   }
 
+  std::signal(SIGINT, HandleSignal);
+  std::signal(SIGTERM, HandleSignal);
+
   try {
     moq::MsQuicClientConfig client_config;
     client_config.host = argv[1];
@@ -135,6 +164,7 @@ int main(int argc, char **argv) {
     moq::SubscribeRequest request;
     request.track_namespace = ParseNamespace(argv[3]);
     request.track_name = argv[4];
+
     auto handler = std::make_shared<PrintingHandler>();
     const moq::SubscriptionHandle subscription = session->subscribe(std::move(request), handler).get();
     std::cout << "subscribed request=" << subscription.request_id();
@@ -143,8 +173,15 @@ int main(int argc, char **argv) {
     }
     std::cout << '\n';
 
+    while (!interrupted.load() && !handler->stopped()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
     session->stop_subscription(subscription.request_id()).get();
     session->close();
+
+    std::cout << "received objects=" << handler->object_count()
+              << " payload_bytes=" << handler->total_payload_bytes() << '\n';
     return 0;
   } catch (const std::exception &error) {
     spdlog::error("subscriber failed: {}", error.what());
