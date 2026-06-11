@@ -171,6 +171,7 @@ QUIC_STATUS MsQuicTransportAdapter::handle_connection_event(HQUIC connection, QU
     const bool unidirectional = (event->PEER_STREAM_STARTED.Flags & QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL) != 0;
     auto stream =
         std::shared_ptr<StreamContext>(new StreamContext(*this, event->PEER_STREAM_STARTED.Stream, unidirectional));
+    stream->set_id(GetStreamID(api_, event->PEER_STREAM_STARTED.Stream));
     api_->SetCallbackHandler(event->PEER_STREAM_STARTED.Stream,
                              reinterpret_cast<void *>(StreamContext::stream_callback), stream.get());
     {
@@ -187,13 +188,17 @@ QUIC_STATUS MsQuicTransportAdapter::handle_connection_event(HQUIC connection, QU
     break;
   }
   case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT: {
-    const std::string message = "Connection shutdown initiated by transport: " +
-                                status_to_string(event->SHUTDOWN_INITIATED_BY_TRANSPORT.ErrorCode);
+    const QUIC_STATUS status = event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status;
+    const uint64_t error_code = event->SHUTDOWN_INITIATED_BY_TRANSPORT.ErrorCode;
+    const std::string message =
+        "Connection shutdown initiated by transport: status=" + status_to_string(status) +
+        " (" + std::to_string(status) + "), error_code=" + std::to_string(error_code);
     callbacks_.transport_error(message);
     break;
   }
   case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER: {
-    const std::string message = "peer shutdown: " + status_to_string(event->SHUTDOWN_INITIATED_BY_PEER.ErrorCode);
+    const std::string message =
+        "peer shutdown: error_code=" + std::to_string(event->SHUTDOWN_INITIATED_BY_PEER.ErrorCode);
     callbacks_.transport_error(message);
     break;
   }
