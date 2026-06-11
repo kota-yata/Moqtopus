@@ -154,7 +154,8 @@ public:
           active->protocol_violation("unknown peer request type " + std::to_string(request_type));
           return;
         }
-        const uint64_t error_code = request_type == codec::kMessagePublish ? 0x20 : 0x03;
+        const RequestErrorCode error_code =
+            request_type == codec::kMessagePublish ? RequestErrorCode::Uninterested : RequestErrorCode::NotSupported;
         const std::string reason = request_type == codec::kMessagePublish ? "subscriber is not accepting PUBLISH"
                                                                           : "subscriber-only implementation";
         peer_stream->send(codec::encode_request_error(error_code, reason), true);
@@ -258,15 +259,11 @@ public:
         }
       };
 
-      if (!stream->send(codec::encode_subscribe(request_id, request))) {
-        throw std::runtime_error("StreamSend failed for SUBSCRIBE");
-      }
+      auto fsm = std::make_shared<SubscriptionFSM>(request_id, std::move(handler), stream, std::move(install_cb),
+                                                   std::move(deactivate_cb), std::move(remove_cb),
+                                                   std::move(subscribe_result_cb));
 
-      auto fsm = std::make_shared<SubscriptionFSM>(request_id, std::move(request), std::move(handler), stream,
-                                                   std::move(install_cb), std::move(deactivate_cb),
-                                                   std::move(remove_cb), std::move(subscribe_result_cb));
-
-      // wire transport stream callbacks into FSM
+      // Install request state before sending so an immediate response cannot race callback setup.
       stream->on_bytes([fsm](ByteBuffer bytes, bool fin) mutable { fsm->on_bytes(std::move(bytes), fin); });
       stream->on_peer_send_aborted([fsm](uint64_t error_code) mutable { fsm->on_peer_send_aborted(error_code); });
       stream->on_shutdown([fsm] { fsm->on_shutdown(); });
@@ -274,6 +271,11 @@ public:
       subscriptions_.emplace(request_id, fsm);
       update_subscription_snapshot_from_fsm(request_id);
       refresh_session_snapshot();
+
+      if (!stream->send(codec::encode_subscribe(request_id, request))) {
+        stop_subscription_on_executor(request_id, true);
+        throw std::runtime_error("StreamSend failed for SUBSCRIBE");
+      }
     } catch (...) {
       set_exception(promise, std::current_exception());
     }
@@ -455,7 +457,7 @@ private:
     if (found == subscriptions_.end())
       return;
     auto fsm = found->second;
-    fsm->report_handler_error(ReceiveError{0x12, error});
+    fsm->report_handler_error(ReceiveError{static_cast<uint64_t>(RequestErrorCode::MalformedTrack), error});
     stop_subscription_on_executor(request_id, false);
   }
 
