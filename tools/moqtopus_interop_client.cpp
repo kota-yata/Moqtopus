@@ -1,3 +1,5 @@
+// Interfaces for englishm/moq-interop-runner
+
 #include "moq/subscriber_session.h"
 
 #include <chrono>
@@ -18,9 +20,14 @@ using Clock = std::chrono::steady_clock;
 constexpr std::chrono::seconds kTestTimeout{2};
 constexpr const char *kDefaultRelayUrl = "moqt://localhost:4443";
 
+// https://github.com/englishm/moq-interop-runner/blob/main/docs/TEST-CLIENT-INTERFACE.md#exit-codes
+constexpr int kExitSuccess = 0;
+constexpr int kExitFailure = 1;
+constexpr int kExitUnsupported = 127;
+
 const std::vector<std::string> kTestNames = {
-    "setup-only",          "announce-only",      "publish-namespace-done",
-    "subscribe-error",     "announce-subscribe", "subscribe-before-announce",
+    "setup-only",      "announce-only",      "publish-namespace-done",
+    "subscribe-error", "announce-subscribe", "subscribe-before-announce",
 };
 
 struct Options {
@@ -158,8 +165,7 @@ TestResult RunSetupOnly(const Options &options) {
     result.expected = "peer SETUP";
     result.received = "connection failure";
   }
-  result.duration_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
+  result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
   return result;
 }
 
@@ -193,8 +199,7 @@ TestResult RunSubscribeError(const Options &options) {
     result.expected = "REQUEST_ERROR";
     result.received = "connection or protocol failure";
   }
-  result.duration_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
+  result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
   return result;
 }
 
@@ -261,16 +266,15 @@ int main(int argc, char **argv) {
       for (const std::string &name : kTestNames) {
         std::cout << name << '\n';
       }
-      return 0;
+      return kExitSuccess;
     }
 
     if (options.testcase && !IsKnownTest(*options.testcase)) {
       std::cerr << "unsupported test: " << *options.testcase << '\n';
-      return 127;
+      return kExitUnsupported;
     }
 
-    const std::vector<std::string> tests =
-        options.testcase ? std::vector<std::string>{*options.testcase} : kTestNames;
+    const std::vector<std::string> tests = options.testcase ? std::vector<std::string>{*options.testcase} : kTestNames;
     std::cout << "TAP version 14\n";
     std::cout << "# moqtopus interop client\n";
     std::cout << "# Relay: " << options.relay_url << '\n';
@@ -286,11 +290,11 @@ int main(int argc, char **argv) {
       unsupported = unsupported || (options.testcase.has_value() && result.skipped);
     }
     if (failed) {
-      return 1;
+      return kExitFailure;
     }
-    return unsupported ? 127 : 0;
+    return unsupported ? kExitUnsupported : kExitSuccess;
   } catch (const std::exception &error) {
     std::cerr << "moqtopus interop client: " << error.what() << '\n';
-    return 1;
+    return kExitFailure;
   }
 }
