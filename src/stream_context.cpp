@@ -57,6 +57,9 @@ ByteBuffer copy_buffers(const QUIC_BUFFER *buffers, uint32_t count) {
 
 } // namespace
 
+// StreamContext manages a single QUIC stream, either unidirectional or bidirectional.
+// Messages/Objects on the stream are delegated to the registered callbacks directly from TransportAdapter, without
+// going through demuxers.
 StreamContext::StreamContext(MsQuicTransportAdapter &adapter, HQUIC handle, bool unidirectional)
     : adapter_(adapter), handle_(handle), unidirectional_(unidirectional) {}
 
@@ -130,34 +133,44 @@ QUIC_STATUS StreamContext::handle_event(HQUIC stream, QUIC_STREAM_EVENT *event) 
                   (event->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0);
     ByteBuffer bytes = copy_buffers(event->RECEIVE.Buffers, event->RECEIVE.BufferCount);
     const bool fin = (event->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
-    bytes_callback_(std::move(bytes), fin);
+    if (bytes_callback_) {
+      bytes_callback_(std::move(bytes), fin);
+    }
     break;
   }
   case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN: {
     spdlog::trace("Stream {} peer send shutdown: graceful={}", id(), event->SEND_SHUTDOWN_COMPLETE.Graceful);
-    bytes_callback_(ByteBuffer{}, true);
+    if (bytes_callback_) {
+      bytes_callback_(ByteBuffer{}, true);
+    }
     break;
   }
   case QUIC_STREAM_EVENT_SEND_COMPLETE:
-    spdlog::trace("Stream {} send complete: canceled={}", id(), status_to_string(event->SEND_COMPLETE.Canceled));
+    spdlog::trace("Stream {} send complete: canceled={}", id(), event->SEND_COMPLETE.Canceled);
     delete static_cast<PendingSend *>(event->SEND_COMPLETE.ClientContext);
     break;
   case QUIC_STREAM_EVENT_PEER_SEND_ABORTED: {
     spdlog::trace("Stream {} peer send aborted: error_code={}", id(), event->PEER_SEND_ABORTED.ErrorCode);
     const uint64_t error_code = event->PEER_SEND_ABORTED.ErrorCode;
-    peer_send_aborted_callback_(error_code);
+    if (peer_send_aborted_callback_) {
+      peer_send_aborted_callback_(error_code);
+    }
     break;
   }
   case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED: {
     spdlog::trace("Stream {} peer receive aborted: error_code={}", id(), event->PEER_RECEIVE_ABORTED.ErrorCode);
     const uint64_t error_code = event->PEER_RECEIVE_ABORTED.ErrorCode;
-    peer_receive_aborted_callback_(error_code);
+    if (peer_receive_aborted_callback_) {
+      peer_receive_aborted_callback_(error_code);
+    }
     break;
   }
   case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE: {
     spdlog::trace("Stream {} shutdown complete", id());
     close_handle(stream);
-    shutdown_callback_();
+    if (shutdown_callback_) {
+      shutdown_callback_();
+    }
     adapter_.remove_stream(this);
     break;
   }
