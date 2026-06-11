@@ -94,6 +94,7 @@ PeerBidiDemux::PeerBidiDemux(std::shared_ptr<StreamContext> stream, SessionCallb
 // dispatches bytes on a bidirectional stream as a single request message
 void PeerBidiDemux::feed(ByteBuffer input, bool fin) {
   bytes_.insert(bytes_.end(), input.begin(), input.end());
+  spdlog::debug("PeerBidiDemux feed called with {} bytes (fin={})", input.size(), fin);
   const codec::ControlMessageResult message = codec::read_control_message(bytes_);
   if (message.status != codec::DecodeStatus::Done) {
     if (fin) {

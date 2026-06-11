@@ -16,7 +16,6 @@
 
 namespace moq::detail {
 
-// FSM for a single request stream (SUBSCRIBE / FETCH / ...).
 class SubscriptionFSM {
 public:
   struct PendingUpdate {
@@ -29,9 +28,9 @@ public:
   using RemoveRouteCb = std::function<void(TrackAlias)>;
   using SubscribeResultCb = std::function<void(std::optional<RequestError> rejected, std::optional<TrackAlias> alias)>;
 
-  SubscriptionFSM(RequestId request_id, SubscribeRequest request, std::shared_ptr<ObjectHandler> handler,
-                  std::shared_ptr<StreamContext> stream, InstallRouteCb install_cb, DeactivateRouteCb deactivate_cb,
-                  RemoveRouteCb remove_cb, SubscribeResultCb subscribe_result_cb);
+  SubscriptionFSM(RequestId request_id, std::shared_ptr<ObjectHandler> handler, std::shared_ptr<StreamContext> stream,
+                  InstallRouteCb install_cb, DeactivateRouteCb deactivate_cb, RemoveRouteCb remove_cb,
+                  SubscribeResultCb subscribe_result_cb);
 
   ~SubscriptionFSM();
 
@@ -45,8 +44,7 @@ public:
   void on_shutdown();
 
   // Enqueue a request-update to be sent on this stream. Returns the generated id.
-  RequestId send_request_update(RequestId allocated_request_id, RequestUpdate update,
-                                std::promise<RequestOk> promise,
+  RequestId send_request_update(RequestId allocated_request_id, RequestUpdate update, std::promise<RequestOk> promise,
                                 std::function<bool(ByteBuffer)> sender);
 
   // Stop the subscription and optionally report error to handler.
@@ -64,7 +62,6 @@ private:
   void accept_publish_done(const codec::ControlMessage &message);
 
   RequestId request_id_;
-  SubscribeRequest request_;
   moq::SubscriptionPhase phase_ = moq::SubscriptionPhase::Pending;
   std::optional<TrackAlias> track_alias_;
   std::shared_ptr<StreamContext> stream_;

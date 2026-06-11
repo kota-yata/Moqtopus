@@ -3,9 +3,12 @@
 #include "moq/codec.h"
 
 #include <algorithm>
+#include <iomanip>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <spdlog/spdlog.h>
+#include <sstream>
 #include <utility>
 
 namespace moq::detail {
@@ -77,12 +80,24 @@ bool all_zero_after(const ByteBuffer &bytes, size_t offset) {
                      [](uint8_t byte) { return byte == 0; });
 }
 
+std::string bytes_hex(const ByteBuffer &bytes) {
+  std::ostringstream output;
+  for (size_t index = 0; index < bytes.size(); ++index) {
+    if (index != 0) {
+      output << ' ';
+    }
+    output << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(bytes[index]);
+  }
+  return output.str();
+}
+
 class DataStreamReceiver : public std::enable_shared_from_this<DataStreamReceiver> {
 public:
   DataStreamReceiver(DataPlane &plane, std::shared_ptr<StreamContext> stream)
       : plane_(plane), stream_(std::move(stream)) {}
 
   void feed(ByteBuffer bytes, bool fin) {
+    spdlog::trace("Subgroup stream {} received {} bytes: {} fin={}", stream_->id(), bytes.size(), bytes_hex(bytes), fin);
     buffer_.insert(buffer_.end(), bytes.begin(), bytes.end());
     if (closed_) {
       return;
@@ -172,6 +187,10 @@ private:
     group_id_ = group;
     properties_per_object_ = (type & 0x01) != 0;
     end_of_group_on_fin_ = (type & 0x08) != 0;
+    spdlog::trace(
+        "Subgroup stream {} header type={:#x} alias={} group={} subgroup_mode={} subgroup={} priority={} properties={}",
+        stream_->id(), type, alias_, group_id_, subgroup_id_mode_, subgroup_id_.value_or(0), publisher_priority_,
+        properties_per_object_);
     route_ = plane_.find_route(alias_);
     if (!route_) {
       if (plane_.unknown_alias_policy() == UnknownAliasPolicy::Error) {
@@ -217,6 +236,8 @@ private:
     if (status != ParseStatus::Done) {
       return ParseResult{status, error};
     }
+    spdlog::trace("Subgroup stream {} object delta={} properties_bytes={} payload_length={} buffered_bytes={}",
+                  stream_->id(), object_delta, properties.size(), payload_length, buffer_.size());
 
     std::optional<ObjectStatusCode> object_status;
     ByteBuffer payload;
@@ -264,6 +285,8 @@ private:
     object.stream_id = stream_->id();
     last_object_id_ = object_id;
     erase_prefix(offset);
+    spdlog::trace("Subgroup stream {} delivering object={} payload_bytes={} remaining_bytes={}", stream_->id(),
+                  object_id, object.payload.size(), buffer_.size());
     plane_.deliver(route_, std::move(object));
     return ParseResult{ParseStatus::Done, {}};
   }
