@@ -18,8 +18,6 @@ namespace {
 
 std::atomic_bool interrupted{false};
 
-void HandleSignal(int) { interrupted.store(true); }
-
 bool ParsePort(const char *value, uint16_t &port) {
   try {
     const unsigned long parsed = std::stoul(value);
@@ -96,8 +94,7 @@ public:
     if (object.status) {
       std::cout << " status=" << *object.status;
     } else {
-      std::cout << " payload=" << object.payload.size() << " bytes preview=\"" << PayloadPreview(object.payload)
-                << '"';
+      std::cout << " payload=" << object.payload.size() << " bytes preview=\"" << PayloadPreview(object.payload) << '"';
     }
     std::cout << '\n';
   }
@@ -145,9 +142,6 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  std::signal(SIGINT, HandleSignal);
-  std::signal(SIGTERM, HandleSignal);
-
   try {
     moq::MsQuicClientConfig client_config;
     client_config.host = argv[1];
@@ -180,8 +174,8 @@ int main(int argc, char **argv) {
     session->stop_subscription(subscription.request_id()).get();
     session->close();
 
-    std::cout << "received objects=" << handler->object_count()
-              << " payload_bytes=" << handler->total_payload_bytes() << '\n';
+    std::cout << "received objects=" << handler->object_count() << " payload_bytes=" << handler->total_payload_bytes()
+              << '\n';
     return 0;
   } catch (const std::exception &error) {
     spdlog::error("subscriber failed: {}", error.what());
