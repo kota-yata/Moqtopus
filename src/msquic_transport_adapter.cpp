@@ -83,14 +83,24 @@ MsQuicTransportAdapter::MsQuicTransportAdapter(MsQuicClientConfig config, Callba
 
 MsQuicTransportAdapter::~MsQuicTransportAdapter() {
   {
-    std::lock_guard<std::mutex> lock(streams_mutex_);
-    for (auto &entry : streams_) {
-      if (entry.second->handle_) {
-        api_->StreamClose(entry.second->handle_);
-        entry.second->handle_ = nullptr;
-      }
+    std::unique_lock<std::mutex> lock(shutdown_mutex_);
+    if (shutdown_requested_) {
+      shutdown_cv_.wait_for(lock, config_.idle_timeout, [this] { return shutdown_complete_; });
     }
-    streams_.clear();
+  }
+
+  std::unordered_map<StreamContext *, std::shared_ptr<StreamContext>> streams;
+  {
+    std::lock_guard<std::mutex> lock(streams_mutex_);
+    streams.swap(streams_);
+  }
+  // StreamClose may synchronously invoke a shutdown callback that calls
+  // remove_stream(), so it must run without streams_mutex_ held.
+  for (auto &entry : streams) {
+    if (entry.second->handle_) {
+      api_->StreamClose(entry.second->handle_);
+      entry.second->handle_ = nullptr;
+    }
   }
   if (connection_) {
     api_->ConnectionClose(connection_);
@@ -150,6 +160,10 @@ std::shared_ptr<StreamContext> MsQuicTransportAdapter::open_stream(bool unidirec
 void MsQuicTransportAdapter::shutdown(moq::SessionCloseErrorCode error_code) {
   if (connection_) {
     spdlog::debug("MsQuicTransportAdapter shutdown requested: code={}", static_cast<uint64_t>(error_code));
+    {
+      std::lock_guard<std::mutex> lock(shutdown_mutex_);
+      shutdown_requested_ = true;
+    }
     api_->ConnectionShutdown(connection_, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, static_cast<uint64_t>(error_code));
   }
 }
@@ -190,9 +204,8 @@ QUIC_STATUS MsQuicTransportAdapter::handle_connection_event(HQUIC connection, QU
   case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT: {
     const QUIC_STATUS status = event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status;
     const uint64_t error_code = event->SHUTDOWN_INITIATED_BY_TRANSPORT.ErrorCode;
-    const std::string message =
-        "Connection shutdown initiated by transport: status=" + status_to_string(status) +
-        " (" + std::to_string(status) + "), error_code=" + std::to_string(error_code);
+    const std::string message = "Connection shutdown initiated by transport: status=" + status_to_string(status) +
+                                " (" + std::to_string(status) + "), error_code=" + std::to_string(error_code);
     callbacks_.transport_error(message);
     break;
   }
@@ -205,8 +218,12 @@ QUIC_STATUS MsQuicTransportAdapter::handle_connection_event(HQUIC connection, QU
   case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE: {
     const bool handshake_completed = event->SHUTDOWN_COMPLETE.HandshakeCompleted != FALSE;
     spdlog::debug("MsQuic connection shutdown complete: handshake_completed={}", handshake_completed);
-    close_connection_handle(connection);
     callbacks_.shutdown_complete(handshake_completed);
+    {
+      std::lock_guard<std::mutex> lock(shutdown_mutex_);
+      shutdown_complete_ = true;
+    }
+    shutdown_cv_.notify_all();
     break;
   }
   default:

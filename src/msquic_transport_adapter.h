@@ -5,6 +5,7 @@
 
 #include <msquic.h>
 
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -49,6 +50,10 @@ private:
   HQUIC registration_ = nullptr;
   HQUIC configuration_ = nullptr;
   HQUIC connection_ = nullptr;
+  std::mutex shutdown_mutex_;
+  std::condition_variable shutdown_cv_;
+  bool shutdown_requested_ = false;
+  bool shutdown_complete_ = false;
   std::mutex streams_mutex_;
   std::unordered_map<StreamContext *, std::shared_ptr<StreamContext>> streams_;
   bool started_ = false;
