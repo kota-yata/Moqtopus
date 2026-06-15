@@ -1,6 +1,9 @@
 {
   "name": "moqtopus",
-  "version-string": "0.1.0",
+  "version": "0.0.1",
+  "description": "Media over QUIC Transport client API built on MsQuic",
+  "homepage": "https://github.com/kota-yata/Moqtopus",
+  "license": "MIT",
   "dependencies": [
     "msquic",
     "spdlog"

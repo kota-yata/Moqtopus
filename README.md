@@ -11,6 +11,23 @@ cmake --preset=vcpkg
 cmake --build build
 ```
 
+## Use from CMake
+
+Once installed, Moqtopus provides a CMake config package:
+
+```cmake
+find_package(moqtopus CONFIG REQUIRED)
+target_link_libraries(your_target PRIVATE moqtopus::moq_subscriber)
+```
+
+To install a local checkout:
+
+```sh
+cmake --preset=vcpkg -DMOQTOPUS_BUILD_EXAMPLES=OFF -DMOQTOPUS_BUILD_TOOLS=OFF
+cmake --build build
+cmake --install build --prefix /path/to/prefix
+```
+
 ## Run the Example
 
 The subscriber example accepts connection details on the command line and
