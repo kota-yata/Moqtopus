@@ -55,7 +55,7 @@ struct TestResult {
 
 class NullHandler final : public moq::ObjectHandler {
 public:
-  void on_object(moq::Object) override {}
+  void on_object(const moq::Object &) override {}
   void on_publish_done(moq::PublishDone) override {}
   void on_error(moq::ReceiveError) override {}
 };

@@ -16,44 +16,53 @@
 
 namespace moq::detail {
 
-class SubscriptionFSM {
-public:
-  struct PendingUpdate {
-    RequestId request_id = 0;
-    std::promise<RequestOk> promise;
-  };
+// converts REQUEST_ERROR to a C++ exception
+inline std::exception_ptr rejected_exception(const RequestError &error) {
+  return std::make_exception_ptr(RequestRejected(error.code, error.retry_interval, error.reason));
+}
 
-  using InstallRouteCb = std::function<bool(TrackAlias, std::shared_ptr<ReceiveRoute>)>;
-  using DeactivateRouteCb = std::function<void(TrackAlias)>;
-  using RemoveRouteCb = std::function<void(TrackAlias)>;
+// Route registry operations the FSM needs from its owning session.
+class SubscriptionOwner {
+public:
+  virtual ~SubscriptionOwner() = default;
+
+  virtual bool install_route(TrackAlias alias, std::shared_ptr<ReceiveRoute> route) = 0;
+  virtual void retire_route(TrackAlias alias) = 0;
+};
+
+class SubscriptionFSM final : public StreamSink {
+public:
   using SubscribeResultCb = std::function<void(std::optional<RequestError> rejected, std::optional<TrackAlias> alias)>;
 
   SubscriptionFSM(RequestId request_id, std::shared_ptr<ObjectHandler> handler, std::shared_ptr<StreamContext> stream,
-                  InstallRouteCb install_cb, DeactivateRouteCb deactivate_cb, RemoveRouteCb remove_cb,
-                  SubscribeResultCb subscribe_result_cb);
+                  std::weak_ptr<SubscriptionOwner> owner, SubscribeResultCb subscribe_result_cb);
 
-  ~SubscriptionFSM();
+  // StreamSink: control responses arriving on the SUBSCRIBE bidi stream.
+  void on_receive(const BytesView *chunks, size_t count, bool fin) override;
+  void on_peer_send_aborted(uint64_t error_code) override;
+  void on_stream_closed() override;
 
-  // Feed raw bytes from the peer into this request stream.
-  void on_bytes(ByteBuffer bytes, bool fin);
-
-  // Called when the peer aborts sending on this stream.
-  void on_peer_send_aborted(uint64_t error_code);
-
-  // Called when the stream is shutdown by the peer.
-  void on_shutdown();
-
-  // Enqueue a request-update to be sent on this stream. Returns the generated id.
-  RequestId send_request_update(RequestId allocated_request_id, RequestUpdate update, std::promise<RequestOk> promise,
-                                std::function<bool(ByteBuffer)> sender);
+  // Enqueue a request-update to be sent on this stream.
+  void send_request_update(RequestId allocated_request_id, RequestUpdate update, std::promise<RequestOk> promise,
+                           std::function<bool(ByteBuffer)> sender);
 
   // Stop the subscription and optionally report error to handler.
   void terminate(bool report_error, std::string reason);
 
   moq::SubscriptionPhase phase() const { return phase_; }
   RequestId request_id() const { return request_id_; }
+  std::shared_ptr<StreamContext> stream() const { return stream_; }
+  std::optional<TrackAlias> track_alias() const { return track_alias_; }
+  size_t inflight_updates() const { return updates_.size(); }
+
+  // Allow owner to ask FSM to report an error to the handler.
+  void report_handler_error(const ReceiveError &err) {
+    if (handler_)
+      handler_->on_error(err);
+  }
 
 private:
+  void fail_updates(std::exception_ptr error);
   void handle_control_message(const codec::ControlMessage &message);
   void accept_subscribe_ok(const codec::ControlMessage &message);
   void reject_initial_subscribe(const codec::ControlMessage &message);
@@ -69,22 +78,9 @@ private:
   std::shared_ptr<ObjectHandler> handler_;
   std::shared_ptr<ReceiveRoute> route_;
   bool subscribe_settled_ = false;
-  std::deque<PendingUpdate> updates_;
-
-  InstallRouteCb install_route_cb_;
-  DeactivateRouteCb deactivate_route_cb_;
-  RemoveRouteCb remove_route_cb_;
+  std::deque<std::promise<RequestOk>> updates_; // settled in FIFO order by REQUEST_OK / REQUEST_ERROR
+  std::weak_ptr<SubscriptionOwner> owner_;
   SubscribeResultCb subscribe_result_cb_;
-
-public:
-  std::shared_ptr<StreamContext> stream() const { return stream_; }
-  std::optional<TrackAlias> track_alias() const { return track_alias_; }
-  size_t inflight_updates() const { return updates_.size(); }
-  // Allow owner to ask FSM to report an error to the handler.
-  void report_handler_error(const ReceiveError &err) {
-    if (handler_)
-      handler_->on_error(err);
-  }
 };
 
 } // namespace moq::detail

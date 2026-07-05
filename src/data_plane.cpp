@@ -3,12 +3,10 @@
 #include "moq/codec.h"
 
 #include <algorithm>
-#include <iomanip>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <spdlog/spdlog.h>
-#include <sstream>
 #include <utility>
 
 namespace moq::detail {
@@ -18,155 +16,140 @@ constexpr uint64_t kNormalStatus = 0x0;
 constexpr uint64_t kEndOfGroupStatus = 0x3;
 constexpr uint64_t kEndOfTrackStatus = 0x4;
 
-enum class ParseStatus {
-  Done,
-  NeedMore,
-  Error,
-};
-
-struct ParseResult {
-  ParseStatus status = ParseStatus::NeedMore;
-  std::string error;
-};
-
 bool is_valid_object_status(uint64_t status) {
   return status == kNormalStatus || status == kEndOfGroupStatus || status == kEndOfTrackStatus;
 }
 
-ParseStatus read_varint_at(const ByteBuffer &bytes, size_t &offset, uint64_t &value, std::string &error) {
-  const codec::VarintResult decoded = codec::read_varint(bytes, offset);
-  if (decoded.status == codec::DecodeStatus::NeedMoreData) {
-    return ParseStatus::NeedMore;
-  }
-  if (decoded.status == codec::DecodeStatus::Error) {
-    error = decoded.error;
-    return ParseStatus::Error;
-  }
-  offset += decoded.bytes;
-  value = decoded.value;
-  return ParseStatus::Done;
-}
+enum class Parse { Done, NeedMore, Error };
 
-ParseStatus read_byte_at(const ByteBuffer &bytes, size_t &offset, uint8_t &value) {
-  if (offset >= bytes.size()) {
-    return ParseStatus::NeedMore;
-  }
-  value = bytes[offset++];
-  return ParseStatus::Done;
-}
+// Bounds-checked reader over transport-owned bytes; never copies.
+struct Cursor {
+  const uint8_t *data = nullptr;
+  size_t size = 0;
+  size_t off = 0;
 
-ParseStatus read_properties_at(const ByteBuffer &bytes, size_t &offset, bool require_non_empty,
-                               ObjectProperties &properties, std::string &error) {
+  size_t remaining() const { return size - off; }
+  bool byte(uint8_t &value) { return off < size && (value = data[off++], true); }
+  bool varint(uint64_t &value) {
+    const codec::VarintResult parsed = codec::read_varint(data + off, size - off);
+    if (parsed.status != codec::DecodeStatus::Done) {
+      return false;
+    }
+    value = parsed.value;
+    off += parsed.bytes;
+    return true;
+  }
+  bool view(uint64_t length, BytesView &value) {
+    if (length > remaining()) {
+      return false;
+    }
+    value = BytesView{data + off, static_cast<size_t>(length)};
+    off += static_cast<size_t>(length);
+    return true;
+  }
+};
+
+// object properties: varint length + opaque bytes
+Parse read_properties(Cursor &cursor, bool require_non_empty, BytesView &properties) {
   uint64_t length = 0;
-  const ParseStatus length_status = read_varint_at(bytes, offset, length, error);
-  if (length_status != ParseStatus::Done) {
-    return length_status;
+  if (!cursor.varint(length)) {
+    return Parse::NeedMore;
   }
   if ((require_non_empty && length == 0) || length > 65535) {
-    error = "invalid object properties length";
-    return ParseStatus::Error;
+    return Parse::Error;
   }
-  if (length > bytes.size() - offset) {
-    return ParseStatus::NeedMore;
-  }
-  properties.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
-                    bytes.begin() + static_cast<std::ptrdiff_t>(offset + length));
-  offset += static_cast<size_t>(length);
-  return ParseStatus::Done;
+  return cursor.view(length, properties) ? Parse::Done : Parse::NeedMore;
 }
 
-bool all_zero_after(const ByteBuffer &bytes, size_t offset) {
-  return std::all_of(bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.end(),
-                     [](uint8_t byte) { return byte == 0; });
-}
-
-std::string bytes_hex(const ByteBuffer &bytes) {
-  std::ostringstream output;
-  for (size_t index = 0; index < bytes.size(); ++index) {
-    if (index != 0) {
-      output << ' ';
-    }
-    output << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(bytes[index]);
-  }
-  return output.str();
-}
-
-class DataStreamReceiver : public std::enable_shared_from_this<DataStreamReceiver> {
+// Hot-path sink for one subgroup data stream. The header is parsed once and the
+// route/flags are frozen; each subsequent receive is parsed in place over the
+// QUIC buffers and objects are delivered as views. Only bytes of an object that
+// straddles a receive boundary are copied (into stash_).
+class SubgroupReceiver final : public StreamSink {
 public:
-  DataStreamReceiver(DataPlane &plane, std::shared_ptr<StreamContext> stream)
-      : plane_(plane), stream_(std::move(stream)) {}
+  SubgroupReceiver(DataPlane &plane, std::shared_ptr<StreamContext> stream, ByteBuffer prefix)
+      : plane_(plane), stream_(std::move(stream)), stash_(std::move(prefix)) {}
 
-  void feed(ByteBuffer bytes, bool fin) {
-    spdlog::trace("Subgroup stream {} received {} bytes: {} fin={}", stream_->id(), bytes.size(), bytes_hex(bytes), fin);
-    buffer_.insert(buffer_.end(), bytes.begin(), bytes.end());
+  void on_receive(const BytesView *chunks, size_t count, bool fin) override {
     if (closed_) {
       return;
     }
+    if (stash_.empty() && count == 1) { // fast path: zero copy
+      Cursor cursor{chunks[0].data, chunks[0].size};
+      run(cursor, fin);
+      if (!closed_ && cursor.remaining() != 0) {
+        stash_.assign(cursor.data + cursor.off, cursor.data + cursor.size);
+      }
+      return;
+    }
+    for (size_t index = 0; index < count; ++index) {
+      stash_.insert(stash_.end(), chunks[index].begin(), chunks[index].end());
+    }
+    Cursor cursor{stash_.data(), stash_.size()};
+    run(cursor, fin);
+    if (!closed_) {
+      stash_.erase(stash_.begin(), stash_.begin() + static_cast<std::ptrdiff_t>(cursor.off));
+    }
+  }
+
+  void on_peer_send_aborted(uint64_t) override { closed_ = true; }
+
+private:
+  void run(Cursor &cursor, bool fin) {
     if (!header_done_) {
-      const ParseResult header = parse_header();
-      if (header.status == ParseStatus::Error) {
-        fail_protocol(header.error);
+      const size_t mark = cursor.off;
+      const Parse header = parse_header(cursor);
+      if (header == Parse::Error || closed_) {
         return;
       }
-      if (header.status == ParseStatus::NeedMore) {
+      if (header == Parse::NeedMore) {
+        cursor.off = mark;
         if (fin) {
-          fail_protocol("SUBGROUP_HEADER ended mid-header");
+          fail("SUBGROUP_HEADER ended mid-header");
         }
         return;
       }
     }
-
-    for (;;) {
-      const ParseResult object = parse_object();
-      if (object.status == ParseStatus::Error) {
-        fail_protocol(object.error);
+    while (!closed_) {
+      const size_t mark = cursor.off;
+      const Parse object = parse_object(cursor);
+      if (object == Parse::Error) {
         return;
       }
-      if (object.status == ParseStatus::NeedMore) {
-        if (fin && !buffer_.empty()) {
-          fail_protocol("subgroup stream ended mid-object");
-          return;
+      if (object == Parse::NeedMore) {
+        cursor.off = mark;
+        if (fin && cursor.remaining() != 0) {
+          fail("subgroup stream ended mid-object");
         }
         break;
       }
     }
-
-    if (fin) {
-      close_cleanly();
+    if (fin && !closed_) {
+      closed_ = true;
+      if (route_ && end_of_group_on_fin_ && last_object_id_) {
+        route_->validation.mark_final_object_in_group(group_id_, *last_object_id_);
+      }
     }
   }
 
-  void aborted(uint64_t) { closed_ = true; }
-
-private:
-  ParseResult parse_header() {
-    size_t offset = 0;
-    std::string error;
+  Parse parse_header(Cursor &cursor) {
     uint64_t type = 0;
     uint64_t alias = 0;
-    uint64_t group = 0;
-    ParseStatus status = read_varint_at(buffer_, offset, type, error);
-    if (status != ParseStatus::Done) {
-      return ParseResult{status, error};
+    if (!cursor.varint(type)) {
+      return Parse::NeedMore;
     }
     if (!codec::is_subgroup_stream_type(type)) {
-      return ParseResult{ParseStatus::Error, "invalid SUBGROUP_HEADER stream type"};
+      return fail("invalid SUBGROUP_HEADER stream type");
     }
-    status = read_varint_at(buffer_, offset, alias, error);
-    if (status != ParseStatus::Done) {
-      return ParseResult{status, error};
-    }
-    status = read_varint_at(buffer_, offset, group, error);
-    if (status != ParseStatus::Done) {
-      return ParseResult{status, error};
+    if (!cursor.varint(alias) || !cursor.varint(group_id_)) {
+      return Parse::NeedMore;
     }
 
     subgroup_id_mode_ = static_cast<uint8_t>((type & 0x06) >> 1);
     if (subgroup_id_mode_ == 0x02) {
       uint64_t subgroup = 0;
-      status = read_varint_at(buffer_, offset, subgroup, error);
-      if (status != ParseStatus::Done) {
-        return ParseResult{status, error};
+      if (!cursor.varint(subgroup)) {
+        return Parse::NeedMore;
       }
       subgroup_id_ = subgroup;
     } else if (subgroup_id_mode_ == 0x00) {
@@ -174,96 +157,74 @@ private:
     }
 
     const bool default_priority = (type & 0x20) != 0;
-    if (!default_priority) {
-      uint8_t priority = 0;
-      status = read_byte_at(buffer_, offset, priority);
-      if (status != ParseStatus::Done) {
-        return ParseResult{status, error};
-      }
-      publisher_priority_ = priority;
+    if (!default_priority && !cursor.byte(publisher_priority_)) {
+      return Parse::NeedMore;
     }
 
     alias_ = alias;
-    group_id_ = group;
     properties_per_object_ = (type & 0x01) != 0;
     end_of_group_on_fin_ = (type & 0x08) != 0;
-    spdlog::trace(
-        "Subgroup stream {} header type={:#x} alias={} group={} subgroup_mode={} subgroup={} priority={} properties={}",
-        stream_->id(), type, alias_, group_id_, subgroup_id_mode_, subgroup_id_.value_or(0), publisher_priority_,
-        properties_per_object_);
+    SPDLOG_TRACE("Subgroup stream {} header type={:#x} alias={} group={}", stream_->id(), type, alias_, group_id_);
     route_ = plane_.find_route(alias_);
     if (!route_) {
       if (plane_.unknown_alias_policy() == UnknownAliasPolicy::Error) {
-        return ParseResult{ParseStatus::Error,
-                           "subgroup stream referenced unknown track alias " + std::to_string(alias_)};
+        return fail("subgroup stream referenced unknown track alias " + std::to_string(alias_));
       }
       stream_->abort_receive(0);
       closed_ = true;
-      return ParseResult{ParseStatus::Done, {}};
+      return Parse::Done;
     }
     if (default_priority) {
       publisher_priority_ = route_->default_publisher_priority.load();
     }
     route_->received_stream_count.fetch_add(1);
-    erase_prefix(offset);
     header_done_ = true;
-    return ParseResult{ParseStatus::Done, {}};
+    return Parse::Done;
   }
 
-  ParseResult parse_object() {
-    if (closed_ || buffer_.empty()) {
-      return ParseResult{ParseStatus::NeedMore, {}};
+  Parse parse_object(Cursor &cursor) {
+    if (cursor.remaining() == 0) {
+      return Parse::NeedMore;
     }
-
-    size_t offset = 0;
-    std::string error;
     uint64_t object_delta = 0;
-    ParseStatus status = read_varint_at(buffer_, offset, object_delta, error);
-    if (status != ParseStatus::Done) {
-      return ParseResult{status, error};
+    if (!cursor.varint(object_delta)) {
+      return Parse::NeedMore;
     }
-
-    ObjectProperties properties;
+    BytesView properties;
     if (properties_per_object_) {
-      status = read_properties_at(buffer_, offset, false, properties, error);
-      if (status != ParseStatus::Done) {
-        return ParseResult{status, error};
+      const Parse props = read_properties(cursor, false, properties);
+      if (props == Parse::Error) {
+        return fail("invalid subgroup object properties");
+      }
+      if (props == Parse::NeedMore) {
+        return Parse::NeedMore;
       }
     }
-
     uint64_t payload_length = 0;
-    status = read_varint_at(buffer_, offset, payload_length, error);
-    if (status != ParseStatus::Done) {
-      return ParseResult{status, error};
+    if (!cursor.varint(payload_length)) {
+      return Parse::NeedMore;
     }
-    spdlog::trace("Subgroup stream {} object delta={} properties_bytes={} payload_length={} buffered_bytes={}",
-                  stream_->id(), object_delta, properties.size(), payload_length, buffer_.size());
 
     std::optional<ObjectStatusCode> object_status;
-    ByteBuffer payload;
+    BytesView payload;
     if (payload_length == 0) {
       uint64_t status_code = 0;
-      status = read_varint_at(buffer_, offset, status_code, error);
-      if (status != ParseStatus::Done) {
-        return ParseResult{status, error};
+      if (!cursor.varint(status_code)) {
+        return Parse::NeedMore;
       }
       if (!is_valid_object_status(status_code) || (status_code != kNormalStatus && !properties.empty())) {
-        return ParseResult{ParseStatus::Error, "invalid subgroup object status"};
+        return fail("invalid subgroup object status");
       }
       object_status = status_code;
-    } else {
-      if (payload_length > buffer_.size() - offset) {
-        return ParseResult{ParseStatus::NeedMore, {}};
-      }
-      payload.assign(buffer_.begin() + offset, buffer_.begin() + (offset + payload_length));
-      offset += payload_length;
+    } else if (!cursor.view(payload_length, payload)) {
+      return Parse::NeedMore;
     }
 
     ObjectId object_id = object_delta;
     if (last_object_id_) {
       if (*last_object_id_ == std::numeric_limits<uint64_t>::max() ||
           object_delta > std::numeric_limits<uint64_t>::max() - (*last_object_id_ + 1)) {
-        return ParseResult{ParseStatus::Error, "subgroup Object ID delta overflow"};
+        return fail("subgroup Object ID delta overflow");
       }
       object_id = *last_object_id_ + object_delta + 1;
     }
@@ -279,37 +240,24 @@ private:
     object.object_id = object_id;
     object.publisher_priority = publisher_priority_;
     object.status = object_status;
-    object.properties = std::move(properties);
-    object.payload = std::move(payload);
+    object.properties = properties;
+    object.payload = payload;
     object.delivery_kind = DeliveryKind::SubgroupStream;
     object.stream_id = stream_->id();
     last_object_id_ = object_id;
-    erase_prefix(offset);
-    spdlog::trace("Subgroup stream {} delivering object={} payload_bytes={} remaining_bytes={}", stream_->id(),
-                  object_id, object.payload.size(), buffer_.size());
-    plane_.deliver(route_, std::move(object));
-    return ParseResult{ParseStatus::Done, {}};
+    plane_.deliver(*route_, object);
+    return Parse::Done;
   }
 
-  void erase_prefix(size_t offset) {
-    buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(offset));
-  }
-
-  void fail_protocol(std::string error) {
+  Parse fail(std::string error) {
     closed_ = true;
     plane_.protocol_error(std::move(error));
-  }
-
-  void close_cleanly() {
-    closed_ = true;
-    if (route_ && end_of_group_on_fin_ && last_object_id_) {
-      route_->validation.mark_final_object_in_group(group_id_, *last_object_id_);
-    }
+    return Parse::Error;
   }
 
   DataPlane &plane_;
   std::shared_ptr<StreamContext> stream_;
-  ByteBuffer buffer_;
+  ByteBuffer stash_;
   std::shared_ptr<ReceiveRoute> route_;
   bool header_done_ = false;
   bool closed_ = false;
@@ -340,12 +288,6 @@ bool TrackReceiveValidation::validate(const Object &object, std::string &error) 
   return true;
 }
 
-void TrackReceiveValidation::mark_final_object_in_group(GroupId group_id, ObjectId object_id) {
-  final_object_in_group_[group_id] = object_id;
-}
-
-void TrackReceiveValidation::mark_final_object_in_track(Location location) { final_object_in_track_ = location; }
-
 DataPlane::DataPlane(SubscriberConfig config, ProtocolErrorCallback protocol_error, TrackErrorCallback track_error)
     : config_(std::move(config)), protocol_error_callback_(std::move(protocol_error)),
       track_error_callback_(std::move(track_error)) {}
@@ -357,28 +299,26 @@ bool DataPlane::install_route(TrackAlias alias, std::shared_ptr<ReceiveRoute> ro
       return false;
     }
   }
-  auto buffered = unknown_datagrams_.find(alias);
+  const auto buffered = unknown_datagrams_.find(alias);
   if (buffered != unknown_datagrams_.end()) {
-    std::vector<ByteBuffer> datagrams = std::move(buffered->second);
+    const std::vector<ByteBuffer> datagrams = std::move(buffered->second);
     unknown_datagrams_.erase(buffered);
-    for (ByteBuffer &datagram : datagrams) {
+    for (const ByteBuffer &datagram : datagrams) {
       buffered_datagram_bytes_ -= datagram.size();
-      deliver_datagram(std::move(datagram), false);
+      deliver_datagram(BytesView{datagram}, false);
     }
   }
   return true;
 }
 
-void DataPlane::deactivate_route(TrackAlias alias) {
-  const std::shared_ptr<ReceiveRoute> route = find_route(alias);
-  if (route) {
-    route->active.store(false);
-  }
-}
-
-void DataPlane::remove_route(TrackAlias alias) {
+void DataPlane::retire_route(TrackAlias alias) {
   std::unique_lock<std::shared_mutex> lock(routes_mutex_);
-  routes_by_alias_.erase(alias);
+  const auto route = routes_by_alias_.find(alias);
+  if (route == routes_by_alias_.end()) {
+    return;
+  }
+  route->second->active.store(false); // in-flight deliveries check this after route removal
+  routes_by_alias_.erase(route);
 }
 
 std::shared_ptr<ReceiveRoute> DataPlane::find_route(TrackAlias alias) const {
@@ -387,88 +327,68 @@ std::shared_ptr<ReceiveRoute> DataPlane::find_route(TrackAlias alias) const {
   return route == routes_by_alias_.end() ? nullptr : route->second;
 }
 
-void DataPlane::on_datagram(ByteBuffer bytes) { deliver_datagram(std::move(bytes), true); }
+void DataPlane::on_datagram(BytesView datagram) { deliver_datagram(datagram, true); }
 
-void DataPlane::start_subgroup_stream(std::shared_ptr<StreamContext> stream, ByteBuffer initial_bytes, bool fin) {
-  auto receiver = std::make_shared<DataStreamReceiver>(*this, stream);
-  stream->on_bytes(
-      [receiver](ByteBuffer bytes, bool bytes_fin) mutable { receiver->feed(std::move(bytes), bytes_fin); });
-  stream->on_peer_send_aborted([receiver](uint64_t error_code) { receiver->aborted(error_code); });
-  receiver->feed(std::move(initial_bytes), fin);
+void DataPlane::start_subgroup_stream(const std::shared_ptr<StreamContext> &stream, ByteBuffer prefix, bool fin) {
+  auto receiver = std::make_shared<SubgroupReceiver>(*this, stream, std::move(prefix));
+  stream->set_sink(receiver);
+  receiver->on_receive(nullptr, 0, fin); // parse the prefix the gate buffered
 }
 
-UnknownAliasPolicy DataPlane::unknown_alias_policy() const { return config_.unknown_alias_policy; }
-
-void DataPlane::deliver_datagram(ByteBuffer bytes, bool allow_buffer) {
-  size_t offset = 0;
-  std::string error;
+void DataPlane::deliver_datagram(BytesView bytes, bool allow_buffer) {
+  Cursor cursor{bytes.data, bytes.size};
   uint64_t type = 0;
-  ParseStatus status = read_varint_at(bytes, offset, type, error);
-  if (status != ParseStatus::Done) {
-    protocol_error("datagram has malformed type");
-    return;
+  if (!cursor.varint(type)) {
+    return protocol_error("datagram has malformed type");
   }
   if (type == codec::kPaddingDatagramType) {
-    if (!all_zero_after(bytes, offset)) {
+    if (!std::all_of(cursor.data + cursor.off, cursor.data + cursor.size, [](uint8_t byte) { return byte == 0; })) {
       protocol_error("padding datagram contains non-zero bytes");
     }
     return;
   }
   if ((type > 0x0f && (type < 0x20 || type > 0x2f)) || ((type & 0x20) != 0 && (type & 0x02) != 0)) {
-    protocol_error("invalid object datagram type");
-    return;
+    return protocol_error("invalid object datagram type");
   }
 
   uint64_t alias = 0;
   uint64_t group = 0;
-  if (read_varint_at(bytes, offset, alias, error) != ParseStatus::Done ||
-      read_varint_at(bytes, offset, group, error) != ParseStatus::Done) {
-    protocol_error("truncated object datagram header");
-    return;
+  if (!cursor.varint(alias) || !cursor.varint(group)) {
+    return protocol_error("truncated object datagram header");
   }
-
   uint64_t object_id = 0;
-  if ((type & 0x04) == 0 && read_varint_at(bytes, offset, object_id, error) != ParseStatus::Done) {
-    protocol_error("truncated object datagram Object ID");
-    return;
+  if ((type & 0x04) == 0 && !cursor.varint(object_id)) {
+    return protocol_error("truncated object datagram Object ID");
   }
 
   const std::shared_ptr<ReceiveRoute> route = find_route(alias);
   if (!route) {
     if (allow_buffer) {
-      buffer_unknown_datagram(alias, std::move(bytes));
+      buffer_unknown_datagram(alias, bytes);
     }
     return;
   }
 
   uint8_t publisher_priority = route->default_publisher_priority.load();
-  if ((type & 0x08) == 0 && read_byte_at(bytes, offset, publisher_priority) != ParseStatus::Done) {
-    protocol_error("truncated object datagram priority");
-    return;
+  if ((type & 0x08) == 0 && !cursor.byte(publisher_priority)) {
+    return protocol_error("truncated object datagram priority");
   }
-
-  ObjectProperties properties;
-  if ((type & 0x01) != 0) {
-    status = read_properties_at(bytes, offset, true, properties, error);
-    if (status != ParseStatus::Done) {
-      protocol_error("invalid object datagram properties");
-      return;
-    }
+  BytesView properties;
+  if ((type & 0x01) != 0 && read_properties(cursor, true, properties) != Parse::Done) {
+    return protocol_error("invalid object datagram properties");
   }
 
   std::optional<ObjectStatusCode> object_status;
-  ByteBuffer payload;
+  BytesView payload;
   if ((type & 0x20) != 0) {
     uint64_t status_code = 0;
-    if (read_varint_at(bytes, offset, status_code, error) != ParseStatus::Done ||
-        !is_valid_object_status(status_code) || (status_code != kNormalStatus && !properties.empty()) ||
-        offset != bytes.size()) {
-      protocol_error("invalid object datagram status");
-      return;
+    if (!cursor.varint(status_code) || !is_valid_object_status(status_code) ||
+        (status_code != kNormalStatus && !properties.empty()) || cursor.remaining() != 0) {
+      return protocol_error("invalid object datagram status");
     }
     object_status = status_code;
   } else {
-    payload.assign(bytes.begin() + offset, bytes.end());
+    payload = BytesView{cursor.data + cursor.off, cursor.remaining()};
   }
 
   Object object;
@@ -478,16 +398,16 @@ void DataPlane::deliver_datagram(ByteBuffer bytes, bool allow_buffer) {
   object.object_id = object_id;
   object.publisher_priority = publisher_priority;
   object.status = object_status;
-  object.properties = std::move(properties);
-  object.payload = std::move(payload);
+  object.properties = properties;
+  object.payload = payload;
   object.delivery_kind = DeliveryKind::Datagram;
   if ((type & 0x02) != 0) {
     route->validation.mark_final_object_in_group(group, object_id);
   }
-  deliver(route, std::move(object));
+  deliver(*route, object);
 }
 
-void DataPlane::buffer_unknown_datagram(TrackAlias alias, ByteBuffer bytes) {
+void DataPlane::buffer_unknown_datagram(TrackAlias alias, BytesView bytes) {
   switch (config_.unknown_alias_policy) {
   case UnknownAliasPolicy::Drop:
     return;
@@ -497,34 +417,33 @@ void DataPlane::buffer_unknown_datagram(TrackAlias alias, ByteBuffer bytes) {
   case UnknownAliasPolicy::BufferDatagrams:
     break;
   }
-  if (bytes.size() > config_.max_buffered_datagram_bytes ||
-      buffered_datagram_bytes_ + bytes.size() > config_.max_buffered_datagram_bytes) {
+  if (bytes.size > config_.max_buffered_datagram_bytes ||
+      buffered_datagram_bytes_ + bytes.size > config_.max_buffered_datagram_bytes) {
     return;
   }
   std::vector<ByteBuffer> &datagrams = unknown_datagrams_[alias];
   if (datagrams.size() >= config_.max_buffered_datagrams_per_alias) {
     return;
   }
-  buffered_datagram_bytes_ += bytes.size();
-  datagrams.push_back(std::move(bytes));
+  buffered_datagram_bytes_ += bytes.size;
+  datagrams.push_back(bytes.to_owned());
 }
 
-void DataPlane::deliver(std::shared_ptr<ReceiveRoute> route, Object object) {
-  if (!route || !route->active.load()) {
+void DataPlane::deliver(ReceiveRoute &route, const Object &object) {
+  if (!route.active.load()) {
     return;
   }
   std::string error;
-  if (!route->validation.validate(object, error)) {
-    track_error(route->request_id, std::move(error));
-    return;
+  if (!route.validation.validate(object, error)) {
+    return track_error(route.request_id, std::move(error));
   }
   if (object.status && *object.status == kEndOfGroupStatus) {
-    route->validation.mark_final_object_in_group(object.group_id, object.object_id);
+    route.validation.mark_final_object_in_group(object.group_id, object.object_id);
   }
   if (object.status && *object.status == kEndOfTrackStatus) {
-    route->validation.mark_final_object_in_track(Location{object.group_id, object.object_id});
+    route.validation.mark_final_object_in_track(Location{object.group_id, object.object_id});
   }
-  route->handler->on_object(std::move(object));
+  route.handler->on_object(object);
 }
 
 void DataPlane::protocol_error(std::string message) {

@@ -2,11 +2,10 @@
 
 #include "msquic_transport_adapter.h"
 
-#include <msquichelper.h>
 #include <spdlog/spdlog.h>
 
-#include <string>
 #include <utility>
+#include <vector>
 
 namespace moq::detail {
 namespace {
@@ -22,64 +21,14 @@ struct PendingSend {
   QUIC_BUFFER buffer{};
 };
 
-std::string status_to_string(QUIC_STATUS status) {
-  switch (status) {
-  case QUIC_STATUS_BAD_CERTIFICATE:
-    return "BAD_CERTIFICATE";
-  case QUIC_STATUS_UNSUPPORTED_CERTIFICATE:
-    return "UNSUPPORTED_CERTIFICATE";
-  case QUIC_STATUS_REVOKED_CERTIFICATE:
-    return "REVOKED_CERTIFICATE";
-  case QUIC_STATUS_EXPIRED_CERTIFICATE:
-    return "EXPIRED_CERTIFICATE";
-  case QUIC_STATUS_UNKNOWN_CERTIFICATE:
-    return "UNKNOWN_CERTIFICATE";
-  case QUIC_STATUS_REQUIRED_CERTIFICATE:
-    return "REQUIRED_CERTIFICATE";
-  default:
-    return QuicStatusToString(status);
-  }
-}
-
-ByteBuffer copy_buffers(const QUIC_BUFFER *buffers, uint32_t count) {
-  ByteBuffer bytes;
-  size_t total = 0;
-  for (uint32_t index = 0; index < count; ++index) {
-    total += buffers[index].Length;
-  }
-  bytes.reserve(total);
-  for (uint32_t index = 0; index < count; ++index) {
-    const uint8_t *begin = buffers[index].Buffer;
-    bytes.insert(bytes.end(), begin, begin + buffers[index].Length);
-  }
-  return bytes;
-}
-
 } // namespace
 
-// StreamContext manages a single QUIC stream, either unidirectional or bidirectional.
-// Messages/Objects on the stream are delegated to the registered callbacks directly from TransportAdapter, without
-// going through demuxers.
+// StreamContext manages a single QUIC stream. Receive events are handed to the
+// installed StreamSink without copying: the sink parses the QUIC buffers in place.
 StreamContext::StreamContext(MsQuicTransportAdapter &adapter, HQUIC handle, bool unidirectional)
     : adapter_(adapter), handle_(handle), unidirectional_(unidirectional) {}
 
 StreamContext::~StreamContext() = default;
-
-bool StreamContext::unidirectional() const { return unidirectional_; }
-
-uint64_t StreamContext::id() const { return id_; }
-
-void StreamContext::set_id(uint64_t id) { id_ = id; }
-
-void StreamContext::on_bytes(BytesCallback callback) { bytes_callback_ = std::move(callback); }
-
-void StreamContext::on_peer_send_aborted(ErrorCallback callback) { peer_send_aborted_callback_ = std::move(callback); }
-
-void StreamContext::on_peer_receive_aborted(ErrorCallback callback) {
-  peer_receive_aborted_callback_ = std::move(callback);
-}
-
-void StreamContext::on_shutdown(ShutdownCallback callback) { shutdown_callback_ = std::move(callback); }
 
 bool StreamContext::send(ByteBuffer bytes, bool fin) {
   if (!handle_) {
@@ -101,79 +50,61 @@ void StreamContext::abort_receive(uint64_t error_code) {
   }
 }
 
-void StreamContext::abort(uint64_t error_code) {
-  if (handle_) {
-    adapter_.api()->StreamShutdown(handle_, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, error_code);
-  }
-}
-
-void StreamContext::set_receive_enabled(bool enabled) {
-  if (handle_) {
-    adapter_.api()->StreamReceiveSetEnabled(handle_, enabled ? TRUE : FALSE);
-  }
-}
-
 QUIC_STATUS QUIC_API StreamContext::stream_callback(HQUIC stream, void *context, QUIC_STREAM_EVENT *event) {
   return static_cast<StreamContext *>(context)->handle_event(stream, event);
 }
 
 QUIC_STATUS StreamContext::handle_event(HQUIC stream, QUIC_STREAM_EVENT *event) {
+  // Local copy so the sink can swap the stream over to a new sink mid-call.
+  const std::shared_ptr<StreamSink> sink = sink_;
   switch (event->Type) {
-  case QUIC_STREAM_EVENT_START_COMPLETE: {
-    spdlog::trace("Stream {} start complete: status={}", id(), status_to_string(event->START_COMPLETE.Status));
+  case QUIC_STREAM_EVENT_START_COMPLETE:
     set_id(event->START_COMPLETE.ID);
     if (QUIC_FAILED(event->START_COMPLETE.Status)) {
-      const std::string message = std::string("StreamStart failed: ") + status_to_string(event->START_COMPLETE.Status);
-      adapter_.callbacks_.transport_error(message);
+      adapter_.callbacks_.transport_error("StreamStart failed: " + quic_status_string(event->START_COMPLETE.Status));
     }
     break;
-  }
   case QUIC_STREAM_EVENT_RECEIVE: {
-    spdlog::trace("Stream {} received data: length={}, fin={}", id(), event->RECEIVE.TotalBufferLength,
-                  (event->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0);
-    ByteBuffer bytes = copy_buffers(event->RECEIVE.Buffers, event->RECEIVE.BufferCount);
     const bool fin = (event->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
-    if (bytes_callback_) {
-      bytes_callback_(std::move(bytes), fin);
+    SPDLOG_TRACE("Stream {} received {} bytes fin={}", id(), event->RECEIVE.TotalBufferLength, fin);
+    if (!sink) {
+      break;
     }
+    BytesView stack_chunks[4];
+    std::vector<BytesView> spill;
+    const uint32_t count = event->RECEIVE.BufferCount;
+    BytesView *chunks = stack_chunks;
+    if (count > 4) {
+      spill.resize(count);
+      chunks = spill.data();
+    }
+    for (uint32_t index = 0; index < count; ++index) {
+      chunks[index] = BytesView{event->RECEIVE.Buffers[index].Buffer, event->RECEIVE.Buffers[index].Length};
+    }
+    sink->on_receive(chunks, count, fin);
     break;
   }
-  case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN: {
-    spdlog::trace("Stream {} peer send shutdown: graceful={}", id(), event->SEND_SHUTDOWN_COMPLETE.Graceful);
-    if (bytes_callback_) {
-      bytes_callback_(ByteBuffer{}, true);
+  case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
+    if (sink) {
+      sink->on_receive(nullptr, 0, true);
     }
     break;
-  }
   case QUIC_STREAM_EVENT_SEND_COMPLETE:
-    spdlog::trace("Stream {} send complete: canceled={}", id(), event->SEND_COMPLETE.Canceled);
     delete static_cast<PendingSend *>(event->SEND_COMPLETE.ClientContext);
     break;
-  case QUIC_STREAM_EVENT_PEER_SEND_ABORTED: {
-    spdlog::trace("Stream {} peer send aborted: error_code={}", id(), event->PEER_SEND_ABORTED.ErrorCode);
-    const uint64_t error_code = event->PEER_SEND_ABORTED.ErrorCode;
-    if (peer_send_aborted_callback_) {
-      peer_send_aborted_callback_(error_code);
+  case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
+    if (sink) {
+      sink->on_peer_send_aborted(event->PEER_SEND_ABORTED.ErrorCode);
     }
     break;
-  }
-  case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED: {
-    spdlog::trace("Stream {} peer receive aborted: error_code={}", id(), event->PEER_RECEIVE_ABORTED.ErrorCode);
-    const uint64_t error_code = event->PEER_RECEIVE_ABORTED.ErrorCode;
-    if (peer_receive_aborted_callback_) {
-      peer_receive_aborted_callback_(error_code);
-    }
-    break;
-  }
-  case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE: {
-    spdlog::trace("Stream {} shutdown complete", id());
+  case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
     close_handle(stream);
-    if (shutdown_callback_) {
-      shutdown_callback_();
+    sink_.reset(); // break the StreamContext <-> sink ownership cycle
+    if (sink) {
+      sink->on_stream_closed();
     }
     adapter_.remove_stream(this);
     break;
-  }
   default:
     break;
   }

@@ -7,9 +7,8 @@
 #include <msquichelper.h>
 
 namespace moq::detail {
-namespace {
 
-std::string status_to_string(QUIC_STATUS status) {
+std::string quic_status_string(QUIC_STATUS status) {
   switch (status) {
   case QUIC_STATUS_BAD_CERTIFICATE:
     return "BAD_CERTIFICATE";
@@ -28,22 +27,24 @@ std::string status_to_string(QUIC_STATUS status) {
   }
 }
 
+namespace {
+
+void throw_if_failed(QUIC_STATUS status, const char *what) {
+  if (QUIC_FAILED(status)) {
+    throw std::runtime_error(std::string(what) + " failed: " + quic_status_string(status));
+  }
+}
+
 } // namespace
 
 MsQuicTransportAdapter::MsQuicTransportAdapter(MsQuicClientConfig config, Callbacks callbacks)
     : config_(std::move(config)), callbacks_(std::move(callbacks)) {
-  QUIC_STATUS status = MsQuicOpen2(&api_);
-  if (QUIC_FAILED(status)) {
-    throw std::runtime_error(std::string("MsQuicOpen2 failed: ") + status_to_string(status));
-  }
+  throw_if_failed(MsQuicOpen2(&api_), "MsQuicOpen2");
 
   QUIC_REGISTRATION_CONFIG registration_config{};
   registration_config.AppName = "moqtopus";
   registration_config.ExecutionProfile = QUIC_EXECUTION_PROFILE_LOW_LATENCY;
-  status = api_->RegistrationOpen(&registration_config, &registration_);
-  if (QUIC_FAILED(status)) {
-    throw std::runtime_error(std::string("RegistrationOpen failed: ") + status_to_string(status));
-  }
+  throw_if_failed(api_->RegistrationOpen(&registration_config, &registration_), "RegistrationOpen");
 
   QUIC_BUFFER alpn{};
   alpn.Length = static_cast<uint32_t>(config_.alpn.size());
@@ -59,10 +60,8 @@ MsQuicTransportAdapter::MsQuicTransportAdapter(MsQuicClientConfig config, Callba
   settings.DatagramReceiveEnabled = TRUE;
   settings.IsSet.DatagramReceiveEnabled = TRUE;
 
-  status = api_->ConfigurationOpen(registration_, &alpn, 1, &settings, sizeof(settings), nullptr, &configuration_);
-  if (QUIC_FAILED(status)) {
-    throw std::runtime_error(std::string("ConfigurationOpen failed: ") + status_to_string(status));
-  }
+  throw_if_failed(api_->ConfigurationOpen(registration_, &alpn, 1, &settings, sizeof(settings), nullptr, &configuration_),
+                  "ConfigurationOpen");
 
   QUIC_CREDENTIAL_CONFIG credential{};
   credential.Type = QUIC_CREDENTIAL_TYPE_NONE;
@@ -70,15 +69,8 @@ MsQuicTransportAdapter::MsQuicTransportAdapter(MsQuicClientConfig config, Callba
   if (config_.disable_certificate_validation) {
     credential.Flags |= QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
   }
-  status = api_->ConfigurationLoadCredential(configuration_, &credential);
-  if (QUIC_FAILED(status)) {
-    throw std::runtime_error(std::string("ConfigurationLoadCredential failed: ") + status_to_string(status));
-  }
-
-  status = api_->ConnectionOpen(registration_, connection_callback, this, &connection_);
-  if (QUIC_FAILED(status)) {
-    throw std::runtime_error(std::string("ConnectionOpen failed: ") + status_to_string(status));
-  }
+  throw_if_failed(api_->ConfigurationLoadCredential(configuration_, &credential), "ConfigurationLoadCredential");
+  throw_if_failed(api_->ConnectionOpen(registration_, connection_callback, this, &connection_), "ConnectionOpen");
 }
 
 MsQuicTransportAdapter::~MsQuicTransportAdapter() {
@@ -104,19 +96,15 @@ MsQuicTransportAdapter::~MsQuicTransportAdapter() {
   }
   if (connection_) {
     api_->ConnectionClose(connection_);
-    connection_ = nullptr;
   }
   if (configuration_) {
     api_->ConfigurationClose(configuration_);
-    configuration_ = nullptr;
   }
   if (registration_) {
     api_->RegistrationClose(registration_);
-    registration_ = nullptr;
   }
   if (api_) {
     MsQuicClose(api_);
-    api_ = nullptr;
   }
 }
 
@@ -124,11 +112,9 @@ void MsQuicTransportAdapter::start() {
   if (started_) {
     return;
   }
-  const QUIC_STATUS status = api_->ConnectionStart(connection_, configuration_, QUIC_ADDRESS_FAMILY_UNSPEC,
-                                                   config_.host.c_str(), config_.port);
-  if (QUIC_FAILED(status)) {
-    throw std::runtime_error(std::string("ConnectionStart failed: ") + status_to_string(status));
-  }
+  throw_if_failed(api_->ConnectionStart(connection_, configuration_, QUIC_ADDRESS_FAMILY_UNSPEC, config_.host.c_str(),
+                                        config_.port),
+                  "ConnectionStart");
   started_ = true;
 }
 
@@ -136,10 +122,8 @@ std::shared_ptr<StreamContext> MsQuicTransportAdapter::open_stream(bool unidirec
   HQUIC handle = nullptr;
   const QUIC_STREAM_OPEN_FLAGS open_flags =
       unidirectional ? QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL : QUIC_STREAM_OPEN_FLAG_NONE;
-  QUIC_STATUS status = api_->StreamOpen(connection_, open_flags, StreamContext::stream_callback, nullptr, &handle);
-  if (QUIC_FAILED(status)) {
-    throw std::runtime_error(std::string("StreamOpen failed: ") + status_to_string(status));
-  }
+  throw_if_failed(api_->StreamOpen(connection_, open_flags, StreamContext::stream_callback, nullptr, &handle),
+                  "StreamOpen");
 
   auto stream = std::shared_ptr<StreamContext>(new StreamContext(*this, handle, unidirectional));
   api_->SetCallbackHandler(handle, reinterpret_cast<void *>(StreamContext::stream_callback), stream.get());
@@ -147,12 +131,12 @@ std::shared_ptr<StreamContext> MsQuicTransportAdapter::open_stream(bool unidirec
     std::lock_guard<std::mutex> lock(streams_mutex_);
     streams_.emplace(stream.get(), stream);
   }
-  status = api_->StreamStart(handle, QUIC_STREAM_START_FLAG_IMMEDIATE);
+  const QUIC_STATUS status = api_->StreamStart(handle, QUIC_STREAM_START_FLAG_IMMEDIATE);
   if (QUIC_FAILED(status)) {
     remove_stream(stream.get());
     api_->StreamClose(handle);
     stream->handle_ = nullptr;
-    throw std::runtime_error(std::string("StreamStart failed: ") + status_to_string(status));
+    throw std::runtime_error(std::string("StreamStart failed: ") + quic_status_string(status));
   }
   return stream;
 }
@@ -177,10 +161,9 @@ QUIC_STATUS QUIC_API MsQuicTransportAdapter::connection_callback(HQUIC connectio
 
 QUIC_STATUS MsQuicTransportAdapter::handle_connection_event(HQUIC connection, QUIC_CONNECTION_EVENT *event) {
   switch (event->Type) {
-  case QUIC_CONNECTION_EVENT_CONNECTED: {
+  case QUIC_CONNECTION_EVENT_CONNECTED:
     callbacks_.connected();
     break;
-  }
   case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED: {
     const bool unidirectional = (event->PEER_STREAM_STARTED.Flags & QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL) != 0;
     auto stream =
@@ -195,26 +178,22 @@ QUIC_STATUS MsQuicTransportAdapter::handle_connection_event(HQUIC connection, QU
     callbacks_.peer_stream_started(stream);
     break;
   }
-  case QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED: {
-    ByteBuffer bytes(event->DATAGRAM_RECEIVED.Buffer->Buffer,
-                     event->DATAGRAM_RECEIVED.Buffer->Buffer + event->DATAGRAM_RECEIVED.Buffer->Length);
-    callbacks_.datagram_received(std::move(bytes));
+  case QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED:
+    callbacks_.datagram_received(
+        BytesView{event->DATAGRAM_RECEIVED.Buffer->Buffer, event->DATAGRAM_RECEIVED.Buffer->Length});
     break;
-  }
   case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT: {
     const QUIC_STATUS status = event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status;
     const uint64_t error_code = event->SHUTDOWN_INITIATED_BY_TRANSPORT.ErrorCode;
-    const std::string message = "Connection shutdown initiated by transport: status=" + status_to_string(status) +
+    const std::string message = "Connection shutdown initiated by transport: status=" + quic_status_string(status) +
                                 " (" + std::to_string(status) + "), error_code=" + std::to_string(error_code);
     callbacks_.transport_error(message);
     break;
   }
-  case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER: {
-    const std::string message =
-        "peer shutdown: error_code=" + std::to_string(event->SHUTDOWN_INITIATED_BY_PEER.ErrorCode);
-    callbacks_.transport_error(message);
+  case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
+    callbacks_.transport_error("peer shutdown: error_code=" +
+                               std::to_string(event->SHUTDOWN_INITIATED_BY_PEER.ErrorCode));
     break;
-  }
   case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE: {
     const bool handshake_completed = event->SHUTDOWN_COMPLETE.HandshakeCompleted != FALSE;
     spdlog::debug("MsQuic connection shutdown complete: handshake_completed={}", handshake_completed);
@@ -235,13 +214,6 @@ QUIC_STATUS MsQuicTransportAdapter::handle_connection_event(HQUIC connection, QU
 void MsQuicTransportAdapter::remove_stream(StreamContext *stream) {
   std::lock_guard<std::mutex> lock(streams_mutex_);
   streams_.erase(stream);
-}
-
-void MsQuicTransportAdapter::close_connection_handle(HQUIC connection) {
-  if (connection_) {
-    api_->ConnectionClose(connection);
-    connection_ = nullptr;
-  }
 }
 
 } // namespace moq::detail

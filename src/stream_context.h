@@ -5,7 +5,6 @@
 #include <msquic.h>
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 
 namespace moq::detail {
@@ -13,30 +12,33 @@ namespace moq::detail {
 // including msquic_transport_adapter.h will cause circular dependency, so forward declare here
 class MsQuicTransportAdapter;
 
+// Receives stream events directly on the QUIC callback thread. Chunk data is
+// only valid during the on_receive call: consume it or copy the tail needed.
+class StreamSink {
+public:
+  virtual ~StreamSink() = default;
+
+  virtual void on_receive(const BytesView *chunks, size_t count, bool fin) = 0;
+  virtual void on_peer_send_aborted(uint64_t /*error_code*/) {}
+  virtual void on_stream_closed() {}
+};
+
 class StreamContext : public std::enable_shared_from_this<StreamContext> {
 public:
-  // generic callback types
-  using BytesCallback = std::function<void(ByteBuffer, bool)>;
-  using ErrorCallback = std::function<void(uint64_t)>;
-  using ShutdownCallback = std::function<void()>;
-
   ~StreamContext();
 
   StreamContext(const StreamContext &) = delete;
   StreamContext &operator=(const StreamContext &) = delete;
 
-  bool unidirectional() const;
-  uint64_t id() const;
-  void set_id(uint64_t id);
-  void on_bytes(BytesCallback callback);
-  void on_peer_send_aborted(ErrorCallback callback);
-  void on_peer_receive_aborted(ErrorCallback callback);
-  void on_shutdown(ShutdownCallback callback);
+  bool unidirectional() const { return unidirectional_; }
+  uint64_t id() const { return id_; }
+  void set_id(uint64_t id) { id_ = id; }
+
+  // A sink may swap itself out mid-call; later events go to the new sink.
+  void set_sink(std::shared_ptr<StreamSink> sink) { sink_ = std::move(sink); }
 
   bool send(ByteBuffer bytes, bool fin = false);
   void abort_receive(uint64_t error_code);
-  void abort(uint64_t error_code);
-  void set_receive_enabled(bool enabled);
 
 private:
   friend class MsQuicTransportAdapter;
@@ -50,10 +52,7 @@ private:
   HQUIC handle_ = nullptr;
   bool unidirectional_ = false;
   uint64_t id_ = 0;
-  BytesCallback bytes_callback_;
-  ErrorCallback peer_send_aborted_callback_;
-  ErrorCallback peer_receive_aborted_callback_;
-  ShutdownCallback shutdown_callback_;
+  std::shared_ptr<StreamSink> sink_;
 };
 
 } // namespace moq::detail

@@ -3,11 +3,9 @@
 #include "data_plane.h"
 #include "moq/codec.h"
 #include "msquic_transport_adapter.h"
-#include "peer_stream_demux.h"
 #include "request/subscription.h"
 
 #include <algorithm>
-#include <deque>
 #include <exception>
 #include <future>
 #include <limits>
@@ -21,75 +19,33 @@
 namespace moq::detail {
 namespace {
 
-template <typename T> void set_exception(std::promise<T> &promise, const std::string &message) {
+// Settle a promise with an error; ignores promises that were already satisfied.
+template <typename Promise> void fail(Promise &promise, std::exception_ptr error) {
   try {
-    throw std::runtime_error(message);
-  } catch (...) {
-    try {
-      promise.set_exception(std::current_exception());
-    } catch (const std::future_error &) {
-    }
-  }
-}
-
-template <typename T> void set_exception(std::promise<T> &promise, std::exception_ptr exception) {
-  try {
-    promise.set_exception(std::move(exception));
+    promise.set_exception(std::move(error));
   } catch (const std::future_error &) {
   }
 }
 
-template <typename T> void set_exception(const std::shared_ptr<std::promise<T>> &promise, const std::string &message) {
-  try {
-    throw std::runtime_error(message);
-  } catch (...) {
-    try {
-      promise->set_exception(std::current_exception());
-    } catch (const std::future_error &) {
-      // squash because promise is already satisfied with other value or exception
-    }
-  }
-}
-
-template <typename T>
-void set_exception(const std::shared_ptr<std::promise<T>> &promise, std::exception_ptr exception) {
-  try {
-    promise->set_exception(std::move(exception));
-  } catch (const std::future_error &) {
-    // squash because promise is already satisfied with other value or exception
-  }
-}
-
-// converts REQUEST_ERROR to c++ exception
-std::exception_ptr rejected_exception(const RequestError &error) {
-  return std::make_exception_ptr(RequestRejected(error.code, error.retry_interval, error.reason));
+template <typename Promise> void fail(Promise &promise, const std::string &message) {
+  fail(promise, std::make_exception_ptr(std::runtime_error(message)));
 }
 
 std::string default_authority(const MsQuicClientConfig &config) {
-  if (!config.authority.empty()) {
-    return config.authority;
-  }
-  return config.host + ":" + std::to_string(config.port);
+  return config.authority.empty() ? config.host + ":" + std::to_string(config.port) : config.authority;
 }
 
 bool known_peer_request_type(uint64_t type) {
-  switch (type) {
-  case codec::kMessageSubscribe:
-  case codec::kMessagePublish:
-  case codec::kMessagePublishNamespace:
-  case codec::kMessageTrackStatus:
-  case codec::kMessageFetch:
-  case codec::kMessageSubscribeNamespace:
-  case codec::kMessageSubscribeTracks:
-    return true;
-  default:
-    return false;
-  }
+  static constexpr uint64_t kKnown[] = {codec::kMessageSubscribe,     codec::kMessagePublish,
+                                        codec::kMessagePublishNamespace, codec::kMessageTrackStatus,
+                                        codec::kMessageFetch,         codec::kMessageSubscribeNamespace,
+                                        codec::kMessageSubscribeTracks};
+  return std::find(std::begin(kKnown), std::end(kKnown), type) != std::end(kKnown);
 }
 
 } // namespace
 
-class SessionImpl : public std::enable_shared_from_this<SessionImpl> {
+class SessionImpl : public std::enable_shared_from_this<SessionImpl>, public SubscriptionOwner {
 public:
   SessionImpl(MsQuicClientConfig msquic_config, SubscriberConfig subscriber_config)
       : msquic_config_(std::move(msquic_config)), subscriber_config_(std::move(subscriber_config)),
@@ -99,12 +55,7 @@ public:
     refresh_session_snapshot();
   }
 
-private:
-  PeerUniDemux::SessionCallbacks peer_demux_callbacks_uni_;
-  PeerBidiDemux::SessionCallbacksBidi peer_demux_callbacks_bidi_;
-
-public:
-  ~SessionImpl() { close_and_wait(SessionCloseErrorCode::NoError); }
+  ~SessionImpl() override { close(SessionCloseErrorCode::NoError); }
 
   void start() {
     MsQuicTransportAdapter::Callbacks callbacks;
@@ -112,56 +63,13 @@ public:
     callbacks.peer_stream_started = [this](std::shared_ptr<StreamContext> stream) {
       on_peer_stream_started(std::move(stream));
     };
-    callbacks.datagram_received = [this](ByteBuffer bytes) { data_plane_.on_datagram(std::move(bytes)); };
-    callbacks.transport_error = [this](std::string error) { transport_error(std::move(error)); };
+    callbacks.datagram_received = [this](BytesView datagram) { data_plane_.on_datagram(datagram); };
+    callbacks.transport_error = [this](std::string error) {
+      begin_close(SessionCloseErrorCode::InternalError, std::move(error));
+    };
     callbacks.shutdown_complete = [this](bool handshake) { shutdown_complete(handshake); };
     transport_ = std::make_unique<MsQuicTransportAdapter>(msquic_config_, std::move(callbacks));
     transport_->start();
-
-    const std::weak_ptr<SessionImpl> weak = weak_from_this();
-    peer_demux_callbacks_uni_.on_setup = [weak](codec::Setup setup) mutable {
-      if (auto active = weak.lock()) {
-        active->handle_peer_setup(std::move(setup));
-      }
-    };
-    peer_demux_callbacks_uni_.on_subgroup = [weak](std::shared_ptr<StreamContext> peer_stream, ByteBuffer initial,
-                                                   bool fin) mutable {
-      if (auto active = weak.lock()) {
-        active->data_plane_.start_subgroup_stream(std::move(peer_stream), std::move(initial), fin);
-      }
-    };
-    peer_demux_callbacks_uni_.on_padding = [weak](std::shared_ptr<StreamContext> peer_stream, ByteBuffer initial,
-                                                  size_t type_bytes) mutable {
-      if (auto active = weak.lock()) {
-        active->start_padding_stream(std::move(peer_stream), std::move(initial), type_bytes);
-      }
-    };
-    peer_demux_callbacks_uni_.on_fetch = [](std::shared_ptr<StreamContext> peer_stream) mutable {
-      if (peer_stream) {
-        peer_stream->abort_receive(0);
-      }
-    };
-    peer_demux_callbacks_uni_.on_protocol_violation = [weak](std::string error) mutable {
-      if (auto active = weak.lock()) {
-        active->protocol_violation(std::move(error));
-      }
-    };
-    peer_demux_callbacks_bidi_.on_protocol_violation = peer_demux_callbacks_uni_.on_protocol_violation;
-    peer_demux_callbacks_bidi_.on_request = [weak](uint64_t request_type,
-                                                   std::shared_ptr<StreamContext> peer_stream) mutable {
-      if (auto active = weak.lock()) {
-        if (!known_peer_request_type(request_type)) {
-          active->protocol_violation("unknown peer request type " + std::to_string(request_type));
-          return;
-        }
-        const RequestErrorCode error_code =
-            request_type == codec::kMessagePublish ? RequestErrorCode::Uninterested : RequestErrorCode::NotSupported;
-        const std::string reason = request_type == codec::kMessagePublish ? "subscriber is not accepting PUBLISH"
-                                                                          : "subscriber-only implementation";
-        peer_stream->send(codec::encode_request_error(error_code, reason), true);
-        peer_stream->abort_receive(0);
-      }
-    };
   }
 
   // waits until session is either ready or closed
@@ -170,13 +78,11 @@ public:
     std::future<void> future = promise.get_future();
     if (phase_ == SessionPhase::Ready || phase_ == SessionPhase::Draining) {
       promise.set_value();
-      return future;
+    } else if (phase_ == SessionPhase::Closing || phase_ == SessionPhase::Closed) {
+      fail(promise, "MOQT session closed before SETUP completed");
+    } else {
+      ready_waiters_.push_back(std::move(promise));
     }
-    if (phase_ == SessionPhase::Closing || phase_ == SessionPhase::Closed) {
-      set_exception(promise, "MOQT session closed before SETUP completed");
-      return future;
-    }
-    ready_waiters_.push_back(std::move(promise));
     return future;
   }
 
@@ -201,83 +107,54 @@ public:
     auto promise = std::make_shared<std::promise<SubscriptionHandle>>();
     std::future<SubscriptionHandle> future = promise->get_future();
     if (!handler) {
-      set_exception(promise, "SUBSCRIBE requires an ObjectHandler");
+      fail(*promise, "SUBSCRIBE requires an ObjectHandler");
       return future;
     }
     if (phase_ != SessionPhase::Ready) {
-      set_exception(promise, "MOQT session is not ready for SUBSCRIBE");
+      fail(*promise, "MOQT session is not ready for SUBSCRIBE");
       return future;
     }
     try {
       if (request.request_id) {
         throw std::invalid_argument("explicit SUBSCRIBE Request ID is not allowed");
       }
-      RequestId request_id = allocate_request_id();
+      const RequestId request_id = allocate_request_id();
       auto stream = transport_->open_stream(false);
       const std::weak_ptr<SessionImpl> weak = weak_from_this();
 
-      // install route callback: if duplicate alias detected, close session
-      auto install_cb = [weak](TrackAlias alias, std::shared_ptr<ReceiveRoute> route) {
-        if (auto active = weak.lock()) {
-          if (!active->data_plane_.install_route(alias, route)) {
-            active->begin_close(SessionCloseErrorCode::DuplicateTrackAlias,
-                                "SUBSCRIBE_OK reused an established Track Alias");
-            return false;
-          }
-          return true;
-        }
-        return false;
-      };
-
-      auto deactivate_cb = [weak](TrackAlias alias) {
-        if (auto active = weak.lock()) {
-          active->data_plane_.deactivate_route(alias);
-        }
-      };
-
-      auto remove_cb = [weak](TrackAlias alias) {
-        if (auto active = weak.lock()) {
-          active->data_plane_.remove_route(alias);
-        }
-      };
-
-      // subscribe result callback: settle promise and refresh snapshots
+      // settles the subscribe promise and refreshes snapshots
       auto subscribe_result_cb = [weak, promise, request_id](std::optional<RequestError> rejected,
-                                                             std::optional<TrackAlias> alias) {
-        if (auto active = weak.lock()) {
-          if (rejected) {
-            set_exception(promise, rejected_exception(*rejected));
-          } else {
-            try {
-              promise->set_value(SubscriptionHandle(request_id, weak));
-            } catch (...) {
-              set_exception(promise, std::current_exception());
-            }
-          }
-          active->refresh_session_snapshot();
-          active->update_subscription_snapshot_from_fsm(request_id);
+                                                             std::optional<TrackAlias>) {
+        const auto active = weak.lock();
+        if (!active) {
+          return;
         }
+        if (rejected) {
+          fail(*promise, rejected_exception(*rejected));
+        } else {
+          try {
+            promise->set_value(SubscriptionHandle(request_id, weak));
+          } catch (const std::future_error &) {
+          }
+        }
+        active->refresh_session_snapshot();
+        active->update_subscription_snapshot_from_fsm(request_id);
       };
 
-      auto fsm = std::make_shared<SubscriptionFSM>(request_id, std::move(handler), stream, std::move(install_cb),
-                                                   std::move(deactivate_cb), std::move(remove_cb),
+      auto fsm = std::make_shared<SubscriptionFSM>(request_id, std::move(handler), stream, weak_from_this(),
                                                    std::move(subscribe_result_cb));
-
-      // Install request state before sending so an immediate response cannot race callback setup.
-      stream->on_bytes([fsm](ByteBuffer bytes, bool fin) mutable { fsm->on_bytes(std::move(bytes), fin); });
-      stream->on_peer_send_aborted([fsm](uint64_t error_code) mutable { fsm->on_peer_send_aborted(error_code); });
-      stream->on_shutdown([fsm] { fsm->on_shutdown(); });
-
+      // Install request state before sending so an immediate response cannot race sink setup.
+      stream->set_sink(fsm);
       subscriptions_.emplace(request_id, fsm);
       update_subscription_snapshot_from_fsm(request_id);
       refresh_session_snapshot();
 
       if (!stream->send(codec::encode_subscribe(request_id, request))) {
-        stop_subscription_on_executor(request_id, true);
+        stop_subscription_now(request_id, true);
         throw std::runtime_error("StreamSend failed for SUBSCRIBE");
       }
     } catch (...) {
-      set_exception(promise, std::current_exception());
+      fail(*promise, std::current_exception());
     }
     return future;
   }
@@ -287,39 +164,70 @@ public:
     std::future<RequestOk> future = promise.get_future();
     const auto found = subscriptions_.find(existing_request_id);
     if (found == subscriptions_.end() || found->second->phase() != moq::SubscriptionPhase::Established) {
-      set_exception(promise, "REQUEST_UPDATE requires an established subscription");
+      fail(promise, "REQUEST_UPDATE requires an established subscription");
       return future;
     }
     auto fsm = found->second;
     try {
-      RequestId request_id = allocate_request_id();
+      const RequestId request_id = allocate_request_id();
       auto stream = fsm->stream();
-      auto sender = [stream](ByteBuffer bytes) { return stream->send(std::move(bytes)); };
-      fsm->send_request_update(request_id, std::move(update), std::move(promise), sender);
+      fsm->send_request_update(request_id, std::move(update), std::move(promise),
+                               [stream](ByteBuffer bytes) { return stream->send(std::move(bytes)); });
       update_subscription_snapshot_from_fsm(existing_request_id);
     } catch (...) {
-      set_exception(promise, std::current_exception());
+      fail(promise, std::current_exception());
     }
     return future;
   }
 
   std::future<void> stop_subscription(RequestId request_id) {
-    auto promise = std::make_shared<std::promise<void>>();
-    std::future<void> future = promise->get_future();
-    stop_subscription_on_executor(request_id, false);
-    promise->set_value();
-    return future;
+    std::promise<void> promise;
+    stop_subscription_now(request_id, false);
+    promise.set_value();
+    return promise.get_future();
   }
 
-  void close(SessionCloseErrorCode error) {
-    spdlog::debug("Session close requested: code={}", static_cast<uint64_t>(error));
-    begin_close(error, "local close");
+  void close(SessionCloseErrorCode error) { begin_close(error, "local close"); }
+
+  // ---- called by stream gates (cold path) ----
+
+  DataPlane &data_plane() { return data_plane_; }
+
+  void handle_peer_setup() {
+    spdlog::debug("Peer SETUP received");
+    peer_setup_received_ = true;
+    maybe_ready();
   }
 
-  void close_and_wait(SessionCloseErrorCode error) {
-    spdlog::debug("Session close-and-wait requested: code={}", static_cast<uint64_t>(error));
-    begin_close(error, "local close");
+  void protocol_violation(std::string error) {
+    begin_close(SessionCloseErrorCode::ProtocolViolation, std::move(error));
   }
+
+  // subscriber-only implementation: refuse every peer-initiated request
+  void reject_peer_request(uint64_t request_type, StreamContext &stream) {
+    if (!known_peer_request_type(request_type)) {
+      protocol_violation("unknown peer request type " + std::to_string(request_type));
+      return;
+    }
+    const bool publish = request_type == codec::kMessagePublish;
+    stream.send(codec::encode_request_error(publish ? RequestErrorCode::Uninterested : RequestErrorCode::NotSupported,
+                                            publish ? "subscriber is not accepting PUBLISH"
+                                                    : "subscriber-only implementation"),
+                true);
+    stream.abort_receive(0);
+  }
+
+  // ---- SubscriptionOwner ----
+
+  bool install_route(TrackAlias alias, std::shared_ptr<ReceiveRoute> route) override {
+    if (data_plane_.install_route(alias, std::move(route))) {
+      return true;
+    }
+    begin_close(SessionCloseErrorCode::DuplicateTrackAlias, "SUBSCRIBE_OK reused an established Track Alias");
+    return false;
+  }
+
+  void retire_route(TrackAlias alias) override { data_plane_.retire_route(alias); }
 
 private:
   // Send SETUP on connection establishment
@@ -335,7 +243,6 @@ private:
       if (!local_setup_stream_->send(codec::encode_setup(default_authority(msquic_config_), msquic_config_.path))) {
         throw std::runtime_error("StreamSend failed for SETUP");
       }
-      spdlog::debug("Local SETUP sent; waiting for peer SETUP");
       local_setup_sent_ = true;
       refresh_session_snapshot();
     } catch (const std::exception &error) {
@@ -343,40 +250,7 @@ private:
     }
   }
 
-  void on_peer_stream_started(std::shared_ptr<StreamContext> stream) {
-    if (stream->unidirectional()) {
-      spdlog::debug("Peer started a unidirectional stream (id={})", stream->id());
-      // It could be unidirectional control streams (SETUP or GOAWAY) or subgroup/padding/fetch streams.
-      // So feed the bytes to default gateway demuxer
-      auto demux = std::make_shared<PeerUniDemux>(stream, peer_demux_callbacks_uni_);
-      stream->on_bytes([demux](ByteBuffer bytes, bool fin) mutable { demux->feed(std::move(bytes), fin); });
-      return;
-    }
-    spdlog::debug("Peer started a bidirectional stream (id={})", stream->id());
-    auto demux = std::make_shared<PeerBidiDemux>(stream, peer_demux_callbacks_bidi_);
-    stream->on_bytes([demux](ByteBuffer bytes, bool fin) mutable { demux->feed(std::move(bytes), fin); });
-  }
-
-  void start_padding_stream(const std::shared_ptr<StreamContext> &stream, ByteBuffer initial, size_t type_bytes) {
-    if (!std::all_of(initial.begin() + type_bytes, initial.end(), [](uint8_t byte) { return byte == 0; })) {
-      protocol_violation("padding stream contains non-zero bytes");
-      return;
-    }
-    std::weak_ptr<SessionImpl> weak = weak_from_this();
-    stream->on_bytes([weak](ByteBuffer bytes, bool) {
-      if (!std::all_of(bytes.begin(), bytes.end(), [](uint8_t byte) { return byte == 0; })) {
-        if (auto active = weak.lock()) {
-          active->protocol_violation("padding stream contains non-zero bytes");
-        }
-      }
-    });
-  }
-
-  void handle_peer_setup(codec::Setup) {
-    spdlog::debug("Peer SETUP received");
-    peer_setup_received_ = true;
-    maybe_ready();
-  }
+  void on_peer_stream_started(std::shared_ptr<StreamContext> stream); // defined after the gates
 
   void maybe_ready() {
     if (!local_setup_sent_ || !peer_setup_received_ || phase_ == SessionPhase::Closing ||
@@ -402,51 +276,16 @@ private:
     return request_id;
   }
 
-  void on_subscription_bytes(RequestId request_id, ByteBuffer bytes, bool fin) {
+  void stop_subscription_now(RequestId request_id, bool report_error) {
     const auto found = subscriptions_.find(request_id);
-    if (found == subscriptions_.end())
+    if (found == subscriptions_.end()) {
       return;
-    auto fsm = found->second;
-    fsm->on_bytes(std::move(bytes), fin);
-    if (fin && fsm->phase() == moq::SubscriptionPhase::Terminated) {
-      update_subscription_snapshot_from_fsm(request_id);
-      refresh_session_snapshot();
-      // keep entry until owner removes it explicitly
     }
-  }
-
-  void subscription_aborted(RequestId request_id, uint64_t error_code) {
-    const auto found = subscriptions_.find(request_id);
-    if (found == subscriptions_.end())
-      return;
-    auto fsm = found->second;
-    fsm->on_peer_send_aborted(error_code);
-    if (fsm->phase() == moq::SubscriptionPhase::Terminated) {
-      update_subscription_snapshot_from_fsm(request_id);
-      refresh_session_snapshot();
-    }
-  }
-
-  void subscription_shutdown(RequestId request_id) {
-    const auto found = subscriptions_.find(request_id);
-    if (found == subscriptions_.end())
-      return;
-    auto fsm = found->second;
-    fsm->on_shutdown();
-    if (fsm->phase() == moq::SubscriptionPhase::Terminated) {
-      update_subscription_snapshot_from_fsm(request_id);
-      refresh_session_snapshot();
-    }
-  }
-
-  void stop_subscription_on_executor(RequestId request_id, bool report_error) {
-    const auto found = subscriptions_.find(request_id);
-    if (found == subscriptions_.end())
-      return;
     auto fsm = found->second;
     fsm->terminate(report_error, report_error ? "subscription stopped after receive error" : std::string{});
-    if (auto s = fsm->stream())
-      s->abort_receive(0);
+    if (auto stream = fsm->stream()) {
+      stream->abort_receive(0);
+    }
     update_subscription_snapshot_from_fsm(request_id);
     refresh_session_snapshot();
     subscriptions_.erase(found);
@@ -454,18 +293,12 @@ private:
 
   void malformed_track(RequestId request_id, std::string error) {
     const auto found = subscriptions_.find(request_id);
-    if (found == subscriptions_.end())
+    if (found == subscriptions_.end()) {
       return;
-    auto fsm = found->second;
-    fsm->report_handler_error(ReceiveError{static_cast<uint64_t>(RequestErrorCode::MalformedTrack), error});
-    stop_subscription_on_executor(request_id, false);
+    }
+    found->second->report_handler_error(ReceiveError{static_cast<uint64_t>(RequestErrorCode::MalformedTrack), error});
+    stop_subscription_now(request_id, false);
   }
-
-  void protocol_violation(std::string error) {
-    begin_close(SessionCloseErrorCode::ProtocolViolation, std::move(error));
-  }
-
-  void transport_error(std::string error) { begin_close(SessionCloseErrorCode::InternalError, std::move(error)); }
 
   void begin_close(SessionCloseErrorCode code, std::string reason) {
     if (phase_ == SessionPhase::Closed || phase_ == SessionPhase::Closing) {
@@ -476,8 +309,9 @@ private:
     close_reason_ = SessionCloseReason{code, reason};
     fail_ready_waiters(reason.empty() ? "MOQT session closing" : reason);
     for (auto &entry : subscriptions_) {
-      if (entry.second)
+      if (entry.second) {
         entry.second->terminate(true, reason);
+      }
     }
     refresh_session_snapshot();
     if (transport_) {
@@ -486,8 +320,7 @@ private:
   }
 
   void shutdown_complete(bool handshake_completed) {
-    spdlog::debug("Session shutdown complete: handshake_completed={} close_reason_set={}", handshake_completed,
-                  static_cast<bool>(close_reason_));
+    spdlog::debug("Session shutdown complete: handshake_completed={}", handshake_completed);
     if (!handshake_completed && !close_reason_) {
       close_reason_ = SessionCloseReason{SessionCloseErrorCode::InternalError, "QUIC handshake did not complete"};
     }
@@ -498,23 +331,20 @@ private:
 
   void fail_ready_waiters(const std::string &reason) {
     for (auto &waiter : ready_waiters_) {
-      set_exception(waiter, reason);
+      fail(waiter, reason);
     }
     ready_waiters_.clear();
   }
 
   void update_subscription_snapshot_from_fsm(RequestId request_id) {
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
-    const auto it = subscriptions_.find(request_id);
-    if (it == subscriptions_.end())
+    const auto found = subscriptions_.find(request_id);
+    if (found == subscriptions_.end()) {
       return;
-    SubscriptionStateSnapshot snapshot;
-    snapshot.request_id = request_id;
-    const auto &fsm = it->second;
-    snapshot.phase = fsm->phase();
-    snapshot.track_alias = fsm->track_alias();
-    snapshot.inflight_updates = fsm->inflight_updates();
-    subscription_snapshots_[request_id] = snapshot;
+    }
+    const auto &fsm = *found->second;
+    subscription_snapshots_[request_id] =
+        SubscriptionStateSnapshot{fsm.phase(), request_id, fsm.track_alias(), fsm.inflight_updates()};
   }
 
   void refresh_session_snapshot() {
@@ -522,18 +352,12 @@ private:
     session_snapshot_.phase = phase_;
     session_snapshot_.local_setup_sent = local_setup_sent_;
     session_snapshot_.peer_setup_received = peer_setup_received_;
-    session_snapshot_.negotiated_version = (phase_ == SessionPhase::Ready || phase_ == SessionPhase::Draining ||
-                                            phase_ == SessionPhase::Closing || phase_ == SessionPhase::Closed)
-                                               ? std::optional<std::string>(msquic_config_.alpn)
-                                               : std::nullopt;
-    size_t active = 0;
-    for (const auto &entry : subscriptions_) {
-      const auto &fsm = entry.second;
-      if (fsm && fsm->phase() != moq::SubscriptionPhase::Terminated) {
-        ++active;
-      }
-    }
-    session_snapshot_.active_subscriptions = active;
+    session_snapshot_.negotiated_version =
+        phase_ >= SessionPhase::Ready ? std::optional<std::string>(msquic_config_.alpn) : std::nullopt;
+    session_snapshot_.active_subscriptions =
+        static_cast<size_t>(std::count_if(subscriptions_.begin(), subscriptions_.end(), [](const auto &entry) {
+          return entry.second && entry.second->phase() != moq::SubscriptionPhase::Terminated;
+        }));
     session_snapshot_.close_reason = close_reason_;
   }
 
@@ -555,6 +379,121 @@ private:
   SessionStateSnapshot session_snapshot_;
   std::unordered_map<RequestId, SubscriptionStateSnapshot> subscription_snapshots_;
 };
+
+namespace {
+
+// Cold path: buffers the first bytes of a peer-initiated stream until it can be
+// classified. Subgroup streams are handed to the DataPlane, which swaps the
+// stream over to the hot-path SubgroupReceiver sink; this gate then dies with it.
+class PeerStreamGate final : public StreamSink {
+public:
+  PeerStreamGate(std::weak_ptr<SessionImpl> session, std::weak_ptr<StreamContext> stream)
+      : session_(std::move(session)), stream_(std::move(stream)) {}
+
+  void on_receive(const BytesView *chunks, size_t count, bool fin) override {
+    const auto session = session_.lock();
+    const auto stream = stream_.lock();
+    if (!session || !stream) {
+      return;
+    }
+    if (mode_ == Mode::Padding) {
+      for (size_t index = 0; index < count; ++index) {
+        if (!all_zero(chunks[index])) {
+          return session->protocol_violation("padding stream contains non-zero bytes");
+        }
+      }
+      return;
+    }
+    if (mode_ == Mode::Done) { // post-SETUP control messages (e.g. GOAWAY) and rejected requests are ignored
+      return;
+    }
+    for (size_t index = 0; index < count; ++index) {
+      bytes_.insert(bytes_.end(), chunks[index].begin(), chunks[index].end());
+    }
+    if (stream->unidirectional()) {
+      classify(*session, stream, fin);
+    } else {
+      reject_request(*session, stream, fin);
+    }
+  }
+
+private:
+  enum class Mode { Classify, Done, Padding };
+
+  static bool all_zero(BytesView bytes) {
+    return std::all_of(bytes.begin(), bytes.end(), [](uint8_t byte) { return byte == 0; });
+  }
+
+  // Unidirectional streams are classified by their first varint.
+  void classify(SessionImpl &session, const std::shared_ptr<StreamContext> &stream, bool fin) {
+    const codec::VarintResult type = codec::read_varint(bytes_);
+    if (type.status != codec::DecodeStatus::Done) {
+      if (fin) {
+        session.protocol_violation("peer unidirectional stream ended before type");
+      }
+      return;
+    }
+    if (type.value == codec::kSetupStreamType) {
+      const codec::ControlMessageResult frame = codec::read_control_message(bytes_);
+      if (frame.status != codec::DecodeStatus::Done) {
+        if (fin) {
+          session.protocol_violation("peer setup stream ended mid-SETUP");
+        }
+        return;
+      }
+      std::string error;
+      if (!codec::decode_setup(frame.message.payload, error)) {
+        return session.protocol_violation(std::move(error));
+      }
+      mode_ = Mode::Done;
+      bytes_.clear();
+      return session.handle_peer_setup();
+    }
+    if (type.value == codec::kFetchStreamType) {
+      return stream->abort_receive(0); // fetch is not supported
+    }
+    if (type.value == codec::kPaddingStreamType) {
+      mode_ = Mode::Padding;
+      if (!all_zero(BytesView{bytes_.data() + type.bytes, bytes_.size() - type.bytes})) {
+        return session.protocol_violation("padding stream contains non-zero bytes");
+      }
+      bytes_.clear();
+      return;
+    }
+    if (codec::is_subgroup_stream_type(type.value)) {
+      return session.data_plane().start_subgroup_stream(stream, std::move(bytes_), fin);
+    }
+    session.protocol_violation("unknown peer unidirectional stream type " + std::to_string(type.value));
+  }
+
+  // A peer-initiated bidirectional stream carries one request, which this
+  // subscriber-only implementation always rejects.
+  void reject_request(SessionImpl &session, const std::shared_ptr<StreamContext> &stream, bool fin) {
+    const codec::ControlMessageResult message = codec::read_control_message(bytes_);
+    if (message.status != codec::DecodeStatus::Done) {
+      if (fin) {
+        session.protocol_violation("peer bidirectional stream ended before first request");
+      }
+      return;
+    }
+    mode_ = Mode::Done;
+    bytes_.clear();
+    session.reject_peer_request(message.message.type, *stream);
+  }
+
+  std::weak_ptr<SessionImpl> session_;
+  std::weak_ptr<StreamContext> stream_;
+  Mode mode_ = Mode::Classify;
+  ByteBuffer bytes_;
+};
+
+} // namespace
+
+void SessionImpl::on_peer_stream_started(std::shared_ptr<StreamContext> stream) {
+  spdlog::debug("Peer started a {} stream (id={})", stream->unidirectional() ? "unidirectional" : "bidirectional",
+                stream->id());
+  stream->set_sink(std::make_shared<PeerStreamGate>(weak_from_this(), stream));
+}
 
 } // namespace moq::detail
 
@@ -614,8 +553,7 @@ void MoqSubscriberSession::close(SessionCloseErrorCode error) { impl_->close(err
 
 MoqSubscriberSession::~MoqSubscriberSession() {
   if (impl_) {
-    spdlog::debug("MoqSubscriberSession destructor initiating shutdown wait");
-    impl_->close_and_wait(SessionCloseErrorCode::NoError);
+    impl_->close(SessionCloseErrorCode::NoError);
   }
 }
 

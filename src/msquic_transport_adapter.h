@@ -14,12 +14,15 @@
 
 namespace moq::detail {
 
+std::string quic_status_string(QUIC_STATUS status);
+
 class MsQuicTransportAdapter {
 public:
   struct Callbacks {
     std::function<void()> connected;
     std::function<void(std::shared_ptr<StreamContext>)> peer_stream_started;
-    std::function<void(ByteBuffer)> datagram_received;
+    // datagram bytes are only valid during the call
+    std::function<void(BytesView)> datagram_received;
     std::function<void(std::string)> transport_error;
     std::function<void(bool)> shutdown_complete;
   };
@@ -42,7 +45,6 @@ private:
   static QUIC_STATUS QUIC_API connection_callback(HQUIC connection, void *context, QUIC_CONNECTION_EVENT *event);
   QUIC_STATUS handle_connection_event(HQUIC connection, QUIC_CONNECTION_EVENT *event);
   void remove_stream(StreamContext *stream);
-  void close_connection_handle(HQUIC connection);
 
   MsQuicClientConfig config_;
   Callbacks callbacks_;

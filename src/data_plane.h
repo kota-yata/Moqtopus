@@ -15,8 +15,8 @@ namespace moq::detail {
 class TrackReceiveValidation {
 public:
   bool validate(const Object &object, std::string &error) const;
-  void mark_final_object_in_group(GroupId group_id, ObjectId object_id);
-  void mark_final_object_in_track(Location location);
+  void mark_final_object_in_group(GroupId group_id, ObjectId object_id) { final_object_in_group_[group_id] = object_id; }
+  void mark_final_object_in_track(Location location) { final_object_in_track_ = location; }
 
 private:
   std::unordered_map<GroupId, ObjectId> final_object_in_group_;
@@ -42,21 +42,23 @@ public:
   DataPlane(SubscriberConfig config, ProtocolErrorCallback protocol_error, TrackErrorCallback track_error);
 
   bool install_route(TrackAlias alias, std::shared_ptr<ReceiveRoute> route);
-  void deactivate_route(TrackAlias alias);
-  void remove_route(TrackAlias alias);
+  void retire_route(TrackAlias alias);
   std::shared_ptr<ReceiveRoute> find_route(TrackAlias alias) const;
 
-  void on_datagram(ByteBuffer bytes);
-  void start_subgroup_stream(std::shared_ptr<StreamContext> stream, ByteBuffer initial_bytes, bool fin);
+  // Parses the datagram in place; bytes are only valid during the call.
+  void on_datagram(BytesView datagram);
+  // Takes over the stream: installs the hot-path SubgroupReceiver as its sink.
+  // `prefix` holds bytes the cold-path gate already buffered ahead of the header.
+  void start_subgroup_stream(const std::shared_ptr<StreamContext> &stream, ByteBuffer prefix, bool fin);
 
-  UnknownAliasPolicy unknown_alias_policy() const;
-  void deliver(std::shared_ptr<ReceiveRoute> route, Object object);
+  UnknownAliasPolicy unknown_alias_policy() const { return config_.unknown_alias_policy; }
+  void deliver(ReceiveRoute &route, const Object &object);
   void protocol_error(std::string message);
+  void track_error(RequestId request_id, std::string message);
 
 private:
-  void deliver_datagram(ByteBuffer bytes, bool allow_buffer);
-  void buffer_unknown_datagram(TrackAlias alias, ByteBuffer bytes);
-  void track_error(RequestId request_id, std::string message);
+  void deliver_datagram(BytesView bytes, bool allow_buffer);
+  void buffer_unknown_datagram(TrackAlias alias, BytesView bytes);
 
   SubscriberConfig config_;
   ProtocolErrorCallback protocol_error_callback_;

@@ -61,11 +61,11 @@ const char *DeliveryName(moq::DeliveryKind delivery) {
   return "unknown";
 }
 
-std::string PayloadPreview(const moq::ByteBuffer &payload) {
+std::string PayloadPreview(moq::BytesView payload) {
   std::ostringstream text;
   constexpr size_t kMaxBytes = 24;
-  for (size_t index = 0; index < payload.size() && index < kMaxBytes; ++index) {
-    const uint8_t byte = payload[index];
+  for (size_t index = 0; index < payload.size && index < kMaxBytes; ++index) {
+    const uint8_t byte = payload.data[index];
     if (byte >= 0x20 && byte <= 0x7e) {
       text << static_cast<char>(byte);
     } else {
@@ -73,7 +73,7 @@ std::string PayloadPreview(const moq::ByteBuffer &payload) {
            << std::setfill(' ');
     }
   }
-  if (payload.size() > kMaxBytes) {
+  if (payload.size > kMaxBytes) {
     text << "...";
   }
   return text.str();
@@ -81,9 +81,9 @@ std::string PayloadPreview(const moq::ByteBuffer &payload) {
 
 class PrintingHandler final : public moq::ObjectHandler {
 public:
-  void on_object(moq::Object object) override {
+  void on_object(const moq::Object &object) override {
     const uint64_t object_count = object_count_.fetch_add(1) + 1;
-    total_payload_bytes_.fetch_add(object.payload.size());
+    total_payload_bytes_.fetch_add(object.payload.size);
 
     std::cout << "object #" << object_count << " delivery=" << DeliveryName(object.delivery_kind)
               << " request=" << object.request_id << " alias=" << object.track_alias << " group=" << object.group_id
@@ -94,7 +94,7 @@ public:
     if (object.status) {
       std::cout << " status=" << *object.status;
     } else {
-      std::cout << " payload=" << object.payload.size() << " bytes preview=\"" << PayloadPreview(object.payload) << '"';
+      std::cout << " payload=" << object.payload.size << " bytes preview=\"" << PayloadPreview(object.payload) << '"';
     }
     std::cout << '\n';
   }

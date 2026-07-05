@@ -2,50 +2,31 @@
 
 #include "moq/codec.h"
 #include "moq/errors.h"
-#include "spdlog/spdlog.h"
 
 #include <utility>
 
 namespace moq::detail {
 
-static std::exception_ptr rejected_exception(const RequestError &error) {
-  return std::make_exception_ptr(RequestRejected(error.code, error.retry_interval, error.reason));
-}
-
 SubscriptionFSM::SubscriptionFSM(RequestId request_id, std::shared_ptr<ObjectHandler> handler,
-                                 std::shared_ptr<StreamContext> stream, InstallRouteCb install_cb,
-                                 DeactivateRouteCb deactivate_cb, RemoveRouteCb remove_cb,
+                                 std::shared_ptr<StreamContext> stream, std::weak_ptr<SubscriptionOwner> owner,
                                  SubscribeResultCb subscribe_result_cb)
-    : request_id_(request_id), stream_(std::move(stream)), handler_(std::move(handler)),
-      install_route_cb_(std::move(install_cb)), deactivate_route_cb_(std::move(deactivate_cb)),
-      remove_route_cb_(std::move(remove_cb)), subscribe_result_cb_(std::move(subscribe_result_cb)) {}
+    : request_id_(request_id), stream_(std::move(stream)), handler_(std::move(handler)), owner_(std::move(owner)),
+      subscribe_result_cb_(std::move(subscribe_result_cb)) {}
 
-SubscriptionFSM::~SubscriptionFSM() = default;
-
-void SubscriptionFSM::on_bytes(ByteBuffer bytes, bool fin) {
-  response_buffer_.insert(response_buffer_.end(), bytes.begin(), bytes.end());
-  for (;;) {
-    if (phase_ == moq::SubscriptionPhase::Terminated || phase_ == moq::SubscriptionPhase::UpdateFailed) {
-      spdlog::debug("Subscription {} ignoring received data in phase {}", request_id_, static_cast<int>(phase_));
-      return;
-    }
-    spdlog::trace("Subscription {} received data: buffer_length={}, fin={}", request_id_, response_buffer_.size(), fin);
-    if (response_buffer_.empty()) {
-      break;
-    }
+void SubscriptionFSM::on_receive(const BytesView *chunks, size_t count, bool fin) {
+  for (size_t index = 0; index < count; ++index) {
+    response_buffer_.insert(response_buffer_.end(), chunks[index].begin(), chunks[index].end());
+  }
+  while (phase_ == moq::SubscriptionPhase::Pending || phase_ == moq::SubscriptionPhase::Established) {
     const codec::ControlMessageResult parsed = codec::read_control_message(response_buffer_);
     if (parsed.status != codec::DecodeStatus::Done) {
-      break;
+      if (fin && !response_buffer_.empty()) {
+        terminate(true, "request stream ended mid-message");
+      }
+      return;
     }
     response_buffer_.erase(response_buffer_.begin(), response_buffer_.begin() + parsed.bytes);
     handle_control_message(parsed.message);
-    if (phase_ == moq::SubscriptionPhase::Terminated) {
-      return;
-    }
-  }
-  if (fin && !response_buffer_.empty()) {
-    handler_->on_error(ReceiveError{0, "request stream ended mid-message"});
-    terminate(true, "request stream ended mid-message");
   }
 }
 
@@ -54,46 +35,37 @@ void SubscriptionFSM::on_peer_send_aborted(uint64_t error_code) {
   terminate(true, "publisher reset request stream");
 }
 
-void SubscriptionFSM::on_shutdown() { terminate(true, "request stream shut down before subscription ended"); }
+void SubscriptionFSM::on_stream_closed() { terminate(true, "request stream shut down before subscription ended"); }
 
-RequestId SubscriptionFSM::send_request_update(RequestId allocated_request_id, RequestUpdate update,
-                                               std::promise<RequestOk> promise,
-                                               std::function<bool(ByteBuffer)> sender) {
-  PendingUpdate pending;
-  pending.request_id = allocated_request_id;
-  pending.promise = std::move(promise);
-  // encode and send via provided sender; failure should surface to caller
+void SubscriptionFSM::send_request_update(RequestId allocated_request_id, RequestUpdate update,
+                                          std::promise<RequestOk> promise, std::function<bool(ByteBuffer)> sender) {
   if (!sender(codec::encode_request_update(allocated_request_id, update))) {
     throw std::runtime_error("StreamSend failed for REQUEST_UPDATE");
   }
-  updates_.push_back(std::move(pending));
-  return allocated_request_id;
+  updates_.push_back(std::move(promise));
+}
+
+// Settles every in-flight REQUEST_UPDATE promise with the same error.
+void SubscriptionFSM::fail_updates(std::exception_ptr error) {
+  while (!updates_.empty()) {
+    try {
+      updates_.front().set_exception(error);
+    } catch (const std::future_error &) {
+    }
+    updates_.pop_front();
+  }
 }
 
 void SubscriptionFSM::terminate(bool report_error, std::string reason) {
   if (phase_ == moq::SubscriptionPhase::Terminated)
     return;
-  if (!subscribe_settled_) {
-    // Owner is responsible for promise settling; mark as settled locally.
-    subscribe_settled_ = true;
-  }
-  while (!updates_.empty()) {
-    PendingUpdate pending = std::move(updates_.front());
-    updates_.pop_front();
-    try {
-      const auto message = reason.empty() ? "subscription terminated before REQUEST_UPDATE completed" : reason;
-      pending.promise.set_exception(std::make_exception_ptr(std::runtime_error(message)));
-    } catch (const std::future_error &e) {
-      if (e.code() != std::make_error_code(std::future_errc::promise_already_satisfied)) {
-        throw;
-      }
-    }
-  }
+  subscribe_settled_ = true; // owner settles the subscribe promise
+  const auto message = reason.empty() ? "subscription terminated before REQUEST_UPDATE completed" : reason;
+  fail_updates(std::make_exception_ptr(std::runtime_error(message)));
   if (track_alias_) {
-    if (deactivate_route_cb_)
-      deactivate_route_cb_(*track_alias_);
-    if (remove_route_cb_)
-      remove_route_cb_(*track_alias_);
+    if (const auto owner = owner_.lock()) {
+      owner->retire_route(*track_alias_);
+    }
   }
   phase_ = moq::SubscriptionPhase::Terminated;
   if (report_error && !reason.empty()) {
@@ -102,47 +74,32 @@ void SubscriptionFSM::terminate(bool report_error, std::string reason) {
 }
 
 void SubscriptionFSM::handle_control_message(const codec::ControlMessage &message) {
-  spdlog::debug("SubscriptionFSM {} handling control message: type={} payload_length={}", request_id_, message.type,
-                message.payload.size());
   if (phase_ == moq::SubscriptionPhase::Pending) {
     if (message.type == codec::kMessageSubscribeOk) {
-      spdlog::trace("SubscriptionFSM {} received SUBSCRIBE_OK", request_id_);
       accept_subscribe_ok(message);
-      return;
-    }
-    if (message.type == codec::kMessageRequestError) {
-      spdlog::trace("SubscriptionFSM {} received initial REQUEST_ERROR", request_id_);
+    } else if (message.type == codec::kMessageRequestError) {
       reject_initial_subscribe(message);
-      return;
+    } else {
+      handler_->on_error(ReceiveError{0, "invalid first response on SUBSCRIBE stream"});
+      terminate(true, "invalid first response on SUBSCRIBE stream");
     }
-    handler_->on_error(ReceiveError{0, "invalid first response on SUBSCRIBE stream"});
-    terminate(true, "invalid first response on SUBSCRIBE stream");
     return;
   }
 
-  if (phase_ == moq::SubscriptionPhase::Terminated) {
-    spdlog::debug("SubscriptionFSM {} received control message after termination: type={}", request_id_, message.type);
-    return;
-  }
   switch (message.type) {
   case codec::kMessageRequestOk:
-    spdlog::trace("SubscriptionFSM {} received REQUEST_OK", request_id_);
     accept_request_ok(message);
     return;
   case codec::kMessageRequestError:
-    spdlog::trace("SubscriptionFSM {} received REQUEST_ERROR", request_id_);
     reject_request_update(message);
     return;
   case codec::kMessagePublishDone:
-    spdlog::trace("SubscriptionFSM {} received PUBLISH_DONE", request_id_);
     accept_publish_done(message);
     return;
   case codec::kMessageGoAway:
     // ignore GoAway for request streams
-    spdlog::trace("SubscriptionFSM {} received GoAway", request_id_);
     return;
   default:
-    spdlog::debug("SubscriptionFSM {} received invalid response on SUBSCRIBE stream: {}", request_id_, message.type);
     handler_->on_error(ReceiveError{0, "invalid response on SUBSCRIBE stream: " + std::to_string(message.type)});
     return;
   }
@@ -159,17 +116,15 @@ void SubscriptionFSM::accept_subscribe_ok(const codec::ControlMessage &message) 
   route->request_id = request_id_;
   route->track_alias = ok->track_alias;
   route->handler = handler_;
-  if (install_route_cb_) {
-    if (!install_route_cb_(ok->track_alias, route)) {
-      terminate(true, "SUBSCRIBE_OK reused an established Track Alias");
-      return;
-    }
+  const auto owner = owner_.lock();
+  if (!owner || !owner->install_route(ok->track_alias, route)) {
+    terminate(true, "SUBSCRIBE_OK reused an established Track Alias");
+    return;
   }
   track_alias_ = ok->track_alias;
   route_ = std::move(route);
   phase_ = moq::SubscriptionPhase::Established;
-  // Notify owner that subscribe was accepted. Owner will settle promises.
-  subscribe_settled_ = true;
+  subscribe_settled_ = true; // owner settles the subscribe promise via the callback
   if (subscribe_result_cb_) {
     subscribe_result_cb_(std::nullopt, track_alias_);
   }
@@ -182,12 +137,9 @@ void SubscriptionFSM::reject_initial_subscribe(const codec::ControlMessage &mess
     terminate(true, error);
     return;
   }
-  if (!subscribe_settled_) {
-    // Notify owner that subscribe was rejected. Owner will settle promises.
-    subscribe_settled_ = true;
-    if (subscribe_result_cb_) {
-      subscribe_result_cb_(rejected, std::nullopt);
-    }
+  subscribe_settled_ = true; // owner settles the subscribe promise via the callback
+  if (subscribe_result_cb_) {
+    subscribe_result_cb_(rejected, std::nullopt);
   }
   terminate(false, {});
 }
@@ -207,12 +159,11 @@ void SubscriptionFSM::accept_request_ok(const codec::ControlMessage &message) {
     terminate(true, "REQUEST_UPDATE_OK included Track Properties");
     return;
   }
-  PendingUpdate pending = std::move(updates_.front());
-  updates_.pop_front();
   try {
-    pending.promise.set_value(*ok);
-  } catch (...) {
+    updates_.front().set_value(*ok);
+  } catch (const std::future_error &) {
   }
+  updates_.pop_front();
 }
 
 void SubscriptionFSM::reject_request_update(const codec::ControlMessage &message) {
@@ -226,15 +177,7 @@ void SubscriptionFSM::reject_request_update(const codec::ControlMessage &message
     terminate(true, error);
     return;
   }
-  const std::exception_ptr exception = rejected_exception(*rejected);
-  while (!updates_.empty()) {
-    PendingUpdate pending = std::move(updates_.front());
-    updates_.pop_front();
-    try {
-      pending.promise.set_exception(exception);
-    } catch (...) {
-    }
-  }
+  fail_updates(rejected_exception(*rejected));
   phase_ = moq::SubscriptionPhase::UpdateFailed;
 }
 

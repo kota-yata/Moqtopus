@@ -42,18 +42,13 @@ struct ReceiveError {
   std::string message;
 };
 
-class ProtocolError : public std::runtime_error {
-public:
-  explicit ProtocolError(const std::string &message) : std::runtime_error(message) {}
-};
-
 class RequestRejected : public std::runtime_error {
 public:
   RequestRejected(RequestErrorCode code, uint64_t retry_interval, std::string reason);
 
-  RequestErrorCode code() const noexcept;
-  uint64_t retry_interval() const noexcept;
-  const std::string &reason() const noexcept;
+  RequestErrorCode code() const noexcept { return code_; }
+  uint64_t retry_interval() const noexcept { return retry_interval_; }
+  const std::string &reason() const noexcept { return reason_; }
 
 private:
   RequestErrorCode code_;

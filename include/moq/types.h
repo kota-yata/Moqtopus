@@ -19,6 +19,22 @@ using TrackNamespace = std::vector<std::string>;
 using TrackName = std::string;
 using ObjectProperties = ByteBuffer;
 
+// Non-owning view into transport-owned bytes. Views handed to callbacks are
+// valid only for the duration of the call; copy with to_owned() to retain.
+struct BytesView {
+  const uint8_t *data = nullptr;
+  size_t size = 0;
+
+  BytesView() = default;
+  BytesView(const uint8_t *data_in, size_t size_in) : data(data_in), size(size_in) {}
+  BytesView(const ByteBuffer &owned) : data(owned.data()), size(owned.size()) {}
+
+  const uint8_t *begin() const { return data; }
+  const uint8_t *end() const { return data + size; }
+  bool empty() const { return size == 0; }
+  ByteBuffer to_owned() const { return ByteBuffer(data, data + size); }
+};
+
 struct Location {
   GroupId group = 0;
   ObjectId object = 0;
@@ -69,6 +85,8 @@ enum class DeliveryKind {
   FetchStream,
 };
 
+// Objects are delivered synchronously from the transport thread; properties
+// and payload are views into receive buffers, valid only during on_object.
 struct Object {
   RequestId request_id = 0;
   TrackAlias track_alias = 0;
@@ -77,8 +95,8 @@ struct Object {
   ObjectId object_id = 0;
   uint8_t publisher_priority = 128;
   std::optional<ObjectStatusCode> status;
-  ObjectProperties properties;
-  ByteBuffer payload;
+  BytesView properties;
+  BytesView payload;
   DeliveryKind delivery_kind = DeliveryKind::Datagram;
   uint64_t stream_id = 0;
 };

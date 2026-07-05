@@ -50,7 +50,6 @@ struct VarintResult {
   DecodeStatus status = DecodeStatus::NeedMoreData;
   uint64_t value = 0;
   size_t bytes = 0;
-  std::string error;
 };
 
 struct ControlMessage {
@@ -62,19 +61,6 @@ struct ControlMessageResult {
   DecodeStatus status = DecodeStatus::NeedMoreData;
   ControlMessage message;
   size_t bytes = 0;
-  std::string error;
-};
-
-struct Setup {
-  struct Option {
-    uint64_t type = 0;
-    ByteBuffer value;
-  };
-
-  std::optional<std::string> path;
-  std::optional<std::string> authority;
-  std::optional<std::string> moqt_implementation;
-  std::vector<Option> options;
 };
 
 struct SubscribeOk {
@@ -84,12 +70,16 @@ struct SubscribeOk {
 };
 
 void write_varint(ByteBuffer &out, uint64_t value);
-VarintResult read_varint(const ByteBuffer &bytes, size_t offset = 0);
+VarintResult read_varint(const uint8_t *data, size_t size, size_t offset = 0);
+inline VarintResult read_varint(const ByteBuffer &bytes, size_t offset = 0) {
+  return read_varint(bytes.data(), bytes.size(), offset);
+}
 void append_control_message(ByteBuffer &out, uint64_t type, const ByteBuffer &payload);
 ControlMessageResult read_control_message(const ByteBuffer &bytes, size_t offset = 0);
 
 ByteBuffer encode_setup(std::string authority, std::string path);
-std::optional<Setup> decode_setup(const ByteBuffer &payload, std::string &error);
+// The subscriber ignores peer SETUP contents; decoding only validates the encoding.
+bool decode_setup(const ByteBuffer &payload, std::string &error);
 ByteBuffer encode_subscribe(RequestId request_id, const SubscribeRequest &request);
 ByteBuffer encode_request_update(RequestId request_id, const RequestUpdate &update);
 ByteBuffer encode_request_error(RequestErrorCode code, std::string reason, uint64_t retry_interval = 0);
