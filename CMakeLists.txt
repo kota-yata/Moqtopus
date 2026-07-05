@@ -29,12 +29,12 @@ target_compile_definitions(moq_subscriber PRIVATE SPDLOG_ACTIVE_LEVEL=SPDLOG_LEV
 if(MOQTOPUS_BUILD_TOOLS)
   # moq-interop-runner compatible test client
   add_executable(moqtopus_interop_client tools/moqtopus_interop_client.cpp)
-  target_link_libraries(moqtopus_interop_client PRIVATE moq_subscriber)
+  target_link_libraries(moqtopus_interop_client PRIVATE moq_subscriber spdlog::spdlog)
 endif()
 
 if(MOQTOPUS_BUILD_EXAMPLES)
   add_executable(subscriber example/subscriber.cpp)
-  target_link_libraries(subscriber PRIVATE moq_subscriber)
+  target_link_libraries(subscriber PRIVATE moq_subscriber spdlog::spdlog)
 endif()
 
 install(
