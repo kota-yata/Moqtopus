@@ -20,6 +20,8 @@ public:
 
   virtual void on_receive(const BytesView *chunks, size_t count, bool fin) = 0;
   virtual void on_peer_send_aborted(uint64_t /*error_code*/) {}
+  // Peer sent STOP_SENDING for our send direction.
+  virtual void on_peer_receive_aborted(uint64_t /*error_code*/) {}
   virtual void on_stream_closed() {}
 };
 
@@ -39,6 +41,10 @@ public:
 
   bool send(ByteBuffer bytes, bool fin = false);
   void abort_receive(uint64_t error_code);
+  // Gracefully finish the send direction (FIN without payload).
+  bool finish_send();
+  // Reset the send direction only; the receive direction stays open.
+  void abort_send(uint64_t error_code);
 
 private:
   friend class MsQuicTransportAdapter;

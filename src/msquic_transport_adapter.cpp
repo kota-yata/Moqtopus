@@ -35,6 +35,17 @@ void throw_if_failed(QUIC_STATUS status, const char *what) {
   }
 }
 
+// Owns the datagram bytes until MsQuic reports a final send state.
+struct PendingDatagram {
+  explicit PendingDatagram(ByteBuffer input) : bytes(std::move(input)) {
+    buffer.Length = static_cast<uint32_t>(bytes.size());
+    buffer.Buffer = bytes.data();
+  }
+
+  ByteBuffer bytes;
+  QUIC_BUFFER buffer{};
+};
+
 } // namespace
 
 MsQuicTransportAdapter::MsQuicTransportAdapter(MsQuicClientConfig config, Callbacks callbacks)
@@ -141,6 +152,19 @@ std::shared_ptr<StreamContext> MsQuicTransportAdapter::open_stream(bool unidirec
   return stream;
 }
 
+bool MsQuicTransportAdapter::send_datagram(ByteBuffer bytes) {
+  if (!connection_) {
+    return false;
+  }
+  auto *pending = new PendingDatagram(std::move(bytes));
+  const QUIC_STATUS status = api_->DatagramSend(connection_, &pending->buffer, 1, QUIC_SEND_FLAG_NONE, pending);
+  if (QUIC_FAILED(status)) {
+    delete pending;
+    return false;
+  }
+  return true;
+}
+
 void MsQuicTransportAdapter::shutdown(moq::SessionCloseErrorCode error_code) {
   if (connection_) {
     spdlog::debug("MsQuicTransportAdapter shutdown requested: code={}", static_cast<uint64_t>(error_code));
@@ -181,6 +205,11 @@ QUIC_STATUS MsQuicTransportAdapter::handle_connection_event(HQUIC connection, QU
   case QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED:
     callbacks_.datagram_received(
         BytesView{event->DATAGRAM_RECEIVED.Buffer->Buffer, event->DATAGRAM_RECEIVED.Buffer->Length});
+    break;
+  case QUIC_CONNECTION_EVENT_DATAGRAM_SEND_STATE_CHANGED:
+    if (QUIC_DATAGRAM_SEND_STATE_IS_FINAL(event->DATAGRAM_SEND_STATE_CHANGED.State)) {
+      delete static_cast<PendingDatagram *>(event->DATAGRAM_SEND_STATE_CHANGED.ClientContext);
+    }
     break;
   case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT: {
     const QUIC_STATUS status = event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status;

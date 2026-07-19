@@ -35,6 +35,9 @@ endif()
 if(MOQTOPUS_BUILD_EXAMPLES)
   add_executable(subscriber example/subscriber.cpp)
   target_link_libraries(subscriber PRIVATE moq_subscriber spdlog::spdlog)
+
+  add_executable(publisher example/publisher.cpp)
+  target_link_libraries(publisher PRIVATE moq_subscriber spdlog::spdlog)
 endif()
 
 install(

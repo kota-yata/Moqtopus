@@ -30,6 +30,27 @@ constexpr uint64_t kMessageFetch = 0x16;
 constexpr uint64_t kMessageSubscribeNamespace = 0x50;
 constexpr uint64_t kMessageSubscribeTracks = 0x51;
 
+// Message parameter identifiers used by the publisher
+constexpr uint64_t kParameterObjectDeliveryTimeout = 0x02;
+constexpr uint64_t kParameterSubgroupDeliveryTimeout = 0x06;
+constexpr uint64_t kParameterLargestObject = 0x09;
+constexpr uint64_t kParameterForward = 0x10;
+constexpr uint64_t kParameterSubscriberPriority = 0x20;
+constexpr uint64_t kParameterSubscriptionFilter = 0x21;
+constexpr uint64_t kParameterGroupOrder = 0x22;
+constexpr uint64_t kParameterNewGroupRequest = 0x32;
+
+// Subscription filter types (Section 5.1.2)
+constexpr uint64_t kFilterNextGroupStart = 0x1;
+constexpr uint64_t kFilterLargestObject = 0x2;
+constexpr uint64_t kFilterAbsoluteStart = 0x3;
+constexpr uint64_t kFilterAbsoluteRange = 0x4;
+
+// Object status codes (Section 11.2.1.1)
+constexpr uint64_t kObjectStatusNormal = 0x0;
+constexpr uint64_t kObjectStatusEndOfGroup = 0x3;
+constexpr uint64_t kObjectStatusEndOfTrack = 0x4;
+
 // Setup option identifiers
 enum class SetupOption : uint64_t {
   // Setup option = None does not exist on the wire;
@@ -69,6 +90,36 @@ struct SubscribeOk {
   ObjectProperties track_properties;
 };
 
+struct Subscribe {
+  RequestId request_id = 0;
+  TrackNamespace track_namespace;
+  TrackName track_name;
+  std::vector<Parameter> parameters;
+};
+
+struct RequestUpdateMessage {
+  RequestId request_id = 0;
+  std::vector<Parameter> parameters;
+};
+
+struct SubscriptionFilter {
+  uint64_t filter_type = kFilterLargestObject;
+  Location start;               // AbsoluteStart / AbsoluteRange only
+  uint64_t end_group_delta = 0; // AbsoluteRange only
+};
+
+// Typed view of the subscription-scoped parameters carried in SUBSCRIBE and
+// REQUEST_UPDATE. An absent optional means the parameter was not present.
+struct SubscriptionOptions {
+  std::optional<uint8_t> forward;
+  std::optional<uint8_t> subscriber_priority;
+  std::optional<uint8_t> group_order;
+  std::optional<SubscriptionFilter> filter;
+  std::optional<uint64_t> subgroup_delivery_timeout;
+  std::optional<uint64_t> object_delivery_timeout;
+  std::optional<uint64_t> new_group_request;
+};
+
 void write_varint(ByteBuffer &out, uint64_t value);
 VarintResult read_varint(const uint8_t *data, size_t size, size_t offset = 0);
 inline VarintResult read_varint(const ByteBuffer &bytes, size_t offset = 0) {
@@ -88,6 +139,28 @@ std::optional<SubscribeOk> decode_subscribe_ok(const ByteBuffer &payload, std::s
 std::optional<RequestOk> decode_request_ok(const ByteBuffer &payload, std::string &error);
 std::optional<RequestError> decode_request_error(const ByteBuffer &payload, std::string &error);
 std::optional<PublishDone> decode_publish_done(const ByteBuffer &payload, std::string &error);
+
+// Publisher-side control message codecs
+std::optional<Subscribe> decode_subscribe(const ByteBuffer &payload, std::string &error);
+std::optional<RequestUpdateMessage> decode_request_update(const ByteBuffer &payload, std::string &error);
+// Validates parameter values; a false return is a protocol violation (session close).
+bool decode_subscription_options(const std::vector<Parameter> &parameters, SubscriptionOptions &options,
+                                 std::string &error);
+ByteBuffer encode_subscribe_ok(TrackAlias track_alias, std::vector<Parameter> parameters,
+                               const ObjectProperties &track_properties);
+ByteBuffer encode_request_ok(std::vector<Parameter> parameters, const ObjectProperties &track_properties = {});
+ByteBuffer encode_publish_done(uint64_t status_code, uint64_t stream_count, const std::string &reason);
+ByteBuffer encode_publish_namespace(RequestId request_id, const TrackNamespace &track_namespace,
+                                    std::vector<Parameter> parameters = {});
+
+// Publisher-side data plane serialization
+ByteBuffer encode_object_datagram(TrackAlias track_alias, GroupId group_id, ObjectId object_id, uint8_t priority,
+                                  BytesView properties, const std::optional<ObjectStatusCode> &status,
+                                  BytesView payload, bool end_of_group);
+void encode_subgroup_header(ByteBuffer &out, TrackAlias track_alias, GroupId group_id, SubgroupId subgroup_id,
+                            uint8_t priority);
+void encode_subgroup_object(ByteBuffer &out, uint64_t object_id_delta, BytesView properties,
+                            const std::optional<ObjectStatusCode> &status, BytesView payload);
 
 void write_track_namespace(ByteBuffer &out, const TrackNamespace &name_space);
 bool is_subgroup_stream_type(uint64_t type);

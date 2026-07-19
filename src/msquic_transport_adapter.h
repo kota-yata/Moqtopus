@@ -1,6 +1,7 @@
 #pragma once
 
-#include "moq/subscriber_session.h"
+#include "moq/client_config.h"
+#include "moq/errors.h"
 #include "stream_context.h"
 
 #include <msquic.h>
@@ -35,6 +36,8 @@ public:
 
   void start();
   std::shared_ptr<StreamContext> open_stream(bool unidirectional);
+  // Fire-and-forget: a false return or a dropped datagram is not reported.
+  bool send_datagram(ByteBuffer bytes);
   void shutdown(moq::SessionCloseErrorCode error_code);
 
   const QUIC_API_TABLE *api() const;

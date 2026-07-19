@@ -50,6 +50,19 @@ void StreamContext::abort_receive(uint64_t error_code) {
   }
 }
 
+bool StreamContext::finish_send() {
+  if (!handle_) {
+    return false;
+  }
+  return !QUIC_FAILED(adapter_.api()->StreamShutdown(handle_, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0));
+}
+
+void StreamContext::abort_send(uint64_t error_code) {
+  if (handle_) {
+    adapter_.api()->StreamShutdown(handle_, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND, error_code);
+  }
+}
+
 QUIC_STATUS QUIC_API StreamContext::stream_callback(HQUIC stream, void *context, QUIC_STREAM_EVENT *event) {
   return static_cast<StreamContext *>(context)->handle_event(stream, event);
 }
@@ -95,6 +108,11 @@ QUIC_STATUS StreamContext::handle_event(HQUIC stream, QUIC_STREAM_EVENT *event) 
   case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
     if (sink) {
       sink->on_peer_send_aborted(event->PEER_SEND_ABORTED.ErrorCode);
+    }
+    break;
+  case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED:
+    if (sink) {
+      sink->on_peer_receive_aborted(event->PEER_RECEIVE_ABORTED.ErrorCode);
     }
     break;
   case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:

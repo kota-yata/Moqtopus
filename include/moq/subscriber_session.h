@@ -1,26 +1,16 @@
 // Public API
 #pragma once
 
+#include "moq/client_config.h"
 #include "moq/errors.h"
 #include "moq/object_handler.h"
 #include "moq/types.h"
 
-#include <chrono>
 #include <future>
 #include <memory>
 #include <string>
 
 namespace moq {
-
-struct MsQuicClientConfig {
-  std::string host;
-  uint16_t port = 0;
-  std::string alpn = "moqt-18";
-  std::string authority;
-  std::string path = "/";
-  bool disable_certificate_validation = true;
-  std::chrono::milliseconds idle_timeout{30000};
-};
 
 enum class UnknownAliasPolicy {
   Drop,

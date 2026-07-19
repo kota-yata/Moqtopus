@@ -37,6 +37,30 @@ enum class RequestErrorCode : uint64_t {
   Redirect = 0x34,
 };
 
+// PUBLISH_DONE status codes (Section 10.11)
+enum class PublishDoneCode : uint64_t {
+  InternalError = 0x0,
+  Unauthorized = 0x1,
+  TrackEnded = 0x2,
+  SubscriptionEnded = 0x3,
+  GoingAway = 0x4,
+  TooFarBehind = 0x5,
+  Expired = 0x6,
+  UpdateFailed = 0x8,
+  ExcessiveLoad = 0x9,
+  MalformedTrack = 0x12,
+};
+
+// Stream reset / STOP_SENDING error codes (Section 3.3.3)
+enum class StreamResetCode : uint64_t {
+  InternalError = 0x0,
+  Cancelled = 0x1,
+  DeliveryTimeout = 0x2,
+  SessionClosed = 0x3,
+  GoingAway = 0x4,
+  TooFarBehind = 0x5,
+};
+
 struct ReceiveError {
   uint64_t code = 0;
   std::string message;

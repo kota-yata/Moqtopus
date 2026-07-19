@@ -513,4 +513,267 @@ std::optional<PublishDone> decode_publish_done(const ByteBuffer &payload, std::s
   return decoded;
 }
 
+std::optional<Subscribe> decode_subscribe(const ByteBuffer &payload, std::string &error) {
+  Cursor cursor{payload};
+  Subscribe subscribe;
+  if (!cursor.read_varint(subscribe.request_id)) {
+    error = "invalid SUBSCRIBE Request ID";
+    return std::nullopt;
+  }
+  if (!read_track_namespace(cursor, &subscribe.track_namespace)) {
+    error = "invalid SUBSCRIBE Track Namespace";
+    return std::nullopt;
+  }
+  uint64_t name_size = 0;
+  if (!cursor.read_varint(name_size) || name_size > 4096 ||
+      !cursor.read_string(static_cast<size_t>(name_size), subscribe.track_name)) {
+    error = "invalid SUBSCRIBE Track Name";
+    return std::nullopt;
+  }
+  uint64_t parameter_count = 0;
+  if (!cursor.read_varint(parameter_count) || !read_parameters(cursor, parameter_count, subscribe.parameters, error)) {
+    if (error.empty()) {
+      error = "invalid SUBSCRIBE parameters";
+    }
+    return std::nullopt;
+  }
+  if (cursor.remaining() != 0) {
+    error = "trailing SUBSCRIBE bytes";
+    return std::nullopt;
+  }
+  return subscribe;
+}
+
+std::optional<RequestUpdateMessage> decode_request_update(const ByteBuffer &payload, std::string &error) {
+  Cursor cursor{payload};
+  RequestUpdateMessage update;
+  if (!cursor.read_varint(update.request_id)) {
+    error = "invalid REQUEST_UPDATE Request ID";
+    return std::nullopt;
+  }
+  uint64_t parameter_count = 0;
+  if (!cursor.read_varint(parameter_count) || !read_parameters(cursor, parameter_count, update.parameters, error)) {
+    if (error.empty()) {
+      error = "invalid REQUEST_UPDATE parameters";
+    }
+    return std::nullopt;
+  }
+  if (cursor.remaining() != 0) {
+    error = "trailing REQUEST_UPDATE bytes";
+    return std::nullopt;
+  }
+  return update;
+}
+
+bool decode_subscription_options(const std::vector<Parameter> &parameters, SubscriptionOptions &options,
+                                 std::string &error) {
+  for (const Parameter &parameter : parameters) {
+    Cursor cursor{parameter.encoded_value};
+    switch (parameter.type) {
+    case kParameterForward: {
+      uint8_t value = 0;
+      cursor.read_byte(value);
+      if (value > 1) {
+        error = "invalid FORWARD parameter value";
+        return false;
+      }
+      options.forward = value;
+      break;
+    }
+    case kParameterSubscriberPriority: {
+      uint8_t value = 0;
+      cursor.read_byte(value);
+      options.subscriber_priority = value;
+      break;
+    }
+    case kParameterGroupOrder: {
+      uint8_t value = 0;
+      cursor.read_byte(value);
+      if (value != 0x1 && value != 0x2) {
+        error = "invalid GROUP_ORDER parameter value";
+        return false;
+      }
+      options.group_order = value;
+      break;
+    }
+    case kParameterSubscriptionFilter: {
+      uint64_t size = 0;
+      cursor.read_varint(size); // shape already validated by read_parameters
+      SubscriptionFilter filter;
+      if (!cursor.read_varint(filter.filter_type)) {
+        error = "truncated SUBSCRIPTION_FILTER";
+        return false;
+      }
+      switch (filter.filter_type) {
+      case kFilterLargestObject:
+      case kFilterNextGroupStart:
+        break;
+      case kFilterAbsoluteStart:
+        if (!cursor.read_varint(filter.start.group) || !cursor.read_varint(filter.start.object)) {
+          error = "truncated SUBSCRIPTION_FILTER Start Location";
+          return false;
+        }
+        break;
+      case kFilterAbsoluteRange:
+        if (!cursor.read_varint(filter.start.group) || !cursor.read_varint(filter.start.object) ||
+            !cursor.read_varint(filter.end_group_delta)) {
+          error = "truncated SUBSCRIPTION_FILTER range";
+          return false;
+        }
+        if (filter.end_group_delta > std::numeric_limits<uint64_t>::max() - filter.start.group) {
+          error = "SUBSCRIPTION_FILTER End Group overflows";
+          return false;
+        }
+        break;
+      default:
+        error = "unknown subscription filter type " + std::to_string(filter.filter_type);
+        return false;
+      }
+      if (cursor.remaining() != 0) {
+        error = "trailing SUBSCRIPTION_FILTER bytes";
+        return false;
+      }
+      options.filter = filter;
+      break;
+    }
+    case kParameterSubgroupDeliveryTimeout: {
+      uint64_t value = 0;
+      cursor.read_varint(value);
+      options.subgroup_delivery_timeout = value;
+      break;
+    }
+    case kParameterObjectDeliveryTimeout: {
+      uint64_t value = 0;
+      cursor.read_varint(value);
+      options.object_delivery_timeout = value;
+      break;
+    }
+    case kParameterNewGroupRequest: {
+      uint64_t value = 0;
+      cursor.read_varint(value);
+      options.new_group_request = value;
+      break;
+    }
+    default:
+      // Known to read_parameters but not subscription-scoped (e.g. AUTHORIZATION
+      // TOKEN, RENDEZVOUS_TIMEOUT); accepted and ignored.
+      break;
+    }
+  }
+  return true;
+}
+
+ByteBuffer encode_subscribe_ok(TrackAlias track_alias, std::vector<Parameter> parameters,
+                               const ObjectProperties &track_properties) {
+  ByteBuffer payload;
+  write_varint(payload, track_alias);
+  if (!encode_parameters(payload, std::move(parameters))) {
+    throw std::invalid_argument("SUBSCRIBE_OK includes an unsupported or duplicate parameter");
+  }
+  payload.insert(payload.end(), track_properties.begin(), track_properties.end());
+  ByteBuffer framed;
+  append_control_message(framed, kMessageSubscribeOk, payload);
+  return framed;
+}
+
+ByteBuffer encode_request_ok(std::vector<Parameter> parameters, const ObjectProperties &track_properties) {
+  ByteBuffer payload;
+  if (!encode_parameters(payload, std::move(parameters))) {
+    throw std::invalid_argument("REQUEST_OK includes an unsupported or duplicate parameter");
+  }
+  payload.insert(payload.end(), track_properties.begin(), track_properties.end());
+  ByteBuffer framed;
+  append_control_message(framed, kMessageRequestOk, payload);
+  return framed;
+}
+
+ByteBuffer encode_publish_done(uint64_t status_code, uint64_t stream_count, const std::string &reason) {
+  ByteBuffer payload;
+  write_varint(payload, status_code);
+  write_varint(payload, stream_count);
+  write_varint(payload, reason.size());
+  append_bytes(payload, reason);
+  ByteBuffer framed;
+  append_control_message(framed, kMessagePublishDone, payload);
+  return framed;
+}
+
+ByteBuffer encode_publish_namespace(RequestId request_id, const TrackNamespace &track_namespace,
+                                    std::vector<Parameter> parameters) {
+  ByteBuffer payload;
+  write_varint(payload, request_id);
+  write_track_namespace(payload, track_namespace);
+  if (!encode_parameters(payload, std::move(parameters))) {
+    throw std::invalid_argument("PUBLISH_NAMESPACE includes an unsupported or duplicate parameter");
+  }
+  ByteBuffer framed;
+  append_control_message(framed, kMessagePublishNamespace, payload);
+  return framed;
+}
+
+ByteBuffer encode_object_datagram(TrackAlias track_alias, GroupId group_id, ObjectId object_id, uint8_t priority,
+                                  BytesView properties, const std::optional<ObjectStatusCode> &status,
+                                  BytesView payload, bool end_of_group) {
+  uint64_t type = 0;
+  if (!properties.empty()) {
+    type |= 0x01; // PROPERTIES
+  }
+  if (status) {
+    type |= 0x20; // STATUS
+  } else if (end_of_group) {
+    type |= 0x02; // END_OF_GROUP
+  }
+  if (object_id == 0) {
+    type |= 0x04; // ZERO_OBJECT_ID
+  }
+
+  ByteBuffer out;
+  write_varint(out, type);
+  write_varint(out, track_alias);
+  write_varint(out, group_id);
+  if (object_id != 0) {
+    write_varint(out, object_id);
+  }
+  out.push_back(priority);
+  if (!properties.empty()) {
+    write_varint(out, properties.size);
+    out.insert(out.end(), properties.begin(), properties.end());
+  }
+  if (status) {
+    write_varint(out, *status);
+  } else {
+    out.insert(out.end(), payload.begin(), payload.end());
+  }
+  return out;
+}
+
+void encode_subgroup_header(ByteBuffer &out, TrackAlias track_alias, GroupId group_id, SubgroupId subgroup_id,
+                            uint8_t priority) {
+  // PROPERTIES always set: objects without properties carry a zero length.
+  // Subgroup 0 uses the implicit mode (0b00); anything else is explicit (0b10).
+  const uint64_t subgroup_id_mode = subgroup_id == 0 ? 0x0 : 0x2;
+  const uint64_t type = 0x10 | 0x01 | (subgroup_id_mode << 1);
+  write_varint(out, type);
+  write_varint(out, track_alias);
+  write_varint(out, group_id);
+  if (subgroup_id != 0) {
+    write_varint(out, subgroup_id);
+  }
+  out.push_back(priority);
+}
+
+void encode_subgroup_object(ByteBuffer &out, uint64_t object_id_delta, BytesView properties,
+                            const std::optional<ObjectStatusCode> &status, BytesView payload) {
+  write_varint(out, object_id_delta);
+  write_varint(out, properties.size);
+  out.insert(out.end(), properties.begin(), properties.end());
+  if (status || payload.empty()) {
+    write_varint(out, 0); // zero payload length introduces an explicit status
+    write_varint(out, status.value_or(kObjectStatusNormal));
+  } else {
+    write_varint(out, payload.size);
+    out.insert(out.end(), payload.begin(), payload.end());
+  }
+}
+
 } // namespace moq::codec

@@ -36,10 +36,10 @@ std::string default_authority(const MsQuicClientConfig &config) {
 }
 
 bool known_peer_request_type(uint64_t type) {
-  static constexpr uint64_t kKnown[] = {codec::kMessageSubscribe,     codec::kMessagePublish,
-                                        codec::kMessagePublishNamespace, codec::kMessageTrackStatus,
-                                        codec::kMessageFetch,         codec::kMessageSubscribeNamespace,
-                                        codec::kMessageSubscribeTracks};
+  static constexpr uint64_t kKnown[] = {
+      codec::kMessageSubscribe,      codec::kMessagePublish, codec::kMessagePublishNamespace,
+      codec::kMessageTrackStatus,    codec::kMessageFetch,   codec::kMessageSubscribeNamespace,
+      codec::kMessageSubscribeTracks};
   return std::find(std::begin(kKnown), std::end(kKnown), type) != std::end(kKnown);
 }
 
@@ -210,10 +210,10 @@ public:
       return;
     }
     const bool publish = request_type == codec::kMessagePublish;
-    stream.send(codec::encode_request_error(publish ? RequestErrorCode::Uninterested : RequestErrorCode::NotSupported,
-                                            publish ? "subscriber is not accepting PUBLISH"
-                                                    : "subscriber-only implementation"),
-                true);
+    stream.send(
+        codec::encode_request_error(publish ? RequestErrorCode::Uninterested : RequestErrorCode::NotSupported,
+                                    publish ? "subscriber is not accepting PUBLISH" : "subscriber-only implementation"),
+        true);
     stream.abort_receive(0);
   }
 
@@ -364,7 +364,6 @@ private:
   MsQuicClientConfig msquic_config_;
   SubscriberConfig subscriber_config_;
   DataPlane data_plane_;
-  std::unique_ptr<MsQuicTransportAdapter> transport_;
 
   SessionPhase phase_ = SessionPhase::Init;
   RequestId next_request_id_ = 0;
@@ -378,6 +377,7 @@ private:
   mutable std::mutex snapshot_mutex_;
   SessionStateSnapshot session_snapshot_;
   std::unordered_map<RequestId, SubscriptionStateSnapshot> subscription_snapshots_;
+  std::unique_ptr<MsQuicTransportAdapter> transport_;
 };
 
 namespace {
