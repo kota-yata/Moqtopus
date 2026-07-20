@@ -1,5 +1,6 @@
-// Interfaces for englishm/moq-interop-runner
+// Interface for englishm/moq-interop-runner.
 
+#include "moq/publisher_session.h"
 #include "moq/subscriber_session.h"
 
 #include <chrono>
@@ -8,17 +9,30 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr std::chrono::seconds kTestTimeout{2};
+constexpr std::chrono::seconds kSetupTimeout{2};
+constexpr std::chrono::seconds kSessionIdleTimeout{5};
+constexpr std::chrono::milliseconds kAnnouncementDelay{500};
+constexpr std::chrono::milliseconds kSubscriberStartDelay{300};
+constexpr std::chrono::milliseconds kPublisherStartDelay{500};
+constexpr std::chrono::milliseconds kWithdrawalDelay{200};
+constexpr std::chrono::milliseconds kSubscribeTimeout{1500};
+constexpr std::chrono::seconds kSubscribeBeforeAnnounceTimeout{2};
 constexpr const char *kDefaultRelayUrl = "moqt://localhost:4443";
+constexpr const char *kTestTrack = "test-track";
+
+const moq::TrackNamespace kTestNamespace = {"moq-test", "interop"};
 
 // https://github.com/englishm/moq-interop-runner/blob/main/docs/TEST-CLIENT-INTERFACE.md#exit-codes
 constexpr int kExitSuccess = 0;
@@ -46,7 +60,6 @@ struct RelayEndpoint {
 
 struct TestResult {
   bool passed = false;
-  bool skipped = false;
   std::string message;
   std::string expected;
   std::string received;
@@ -133,7 +146,7 @@ Options ParseOptions(int argc, char **argv) {
   return options;
 }
 
-std::unique_ptr<moq::MoqSubscriberSession> Connect(const Options &options) {
+moq::MsQuicClientConfig MakeClientConfig(const Options &options) {
   const RelayEndpoint endpoint = ParseRelayUrl(options.relay_url);
   moq::MsQuicClientConfig config;
   config.host = endpoint.host;
@@ -141,23 +154,58 @@ std::unique_ptr<moq::MoqSubscriberSession> Connect(const Options &options) {
   config.path = endpoint.path;
   config.alpn = "moqt-18";
   config.disable_certificate_validation = options.tls_disable_verify;
-  config.idle_timeout = kTestTimeout;
+  config.idle_timeout = kSessionIdleTimeout;
+  return config;
+}
 
-  auto session = moq::MoqSubscriberSession::connect(std::move(config)).get();
-  std::future<void> ready = session->ready();
-  if (ready.wait_for(kTestTimeout) != std::future_status::ready) {
-    session->close();
+template <typename Session> void WaitUntilReady(Session &session) {
+  std::future<void> ready = session.ready();
+  if (ready.wait_for(kSetupTimeout) != std::future_status::ready) {
+    session.close();
     throw std::runtime_error("timeout waiting for peer SETUP");
   }
   ready.get();
+}
+
+std::unique_ptr<moq::MoqSubscriberSession> ConnectSubscriber(const Options &options) {
+  auto session = moq::MoqSubscriberSession::connect(MakeClientConfig(options)).get();
+  WaitUntilReady(*session);
   return session;
+}
+
+std::unique_ptr<moq::MoqPublisherSession> ConnectPublisher(const Options &options) {
+  auto session = moq::MoqPublisherSession::connect(MakeClientConfig(options)).get();
+  WaitUntilReady(*session);
+  return session;
+}
+
+void RegisterTestTrack(moq::MoqPublisherSession &publisher) {
+  moq::PublishedTrack track;
+  track.track_namespace = kTestNamespace;
+  track.track_name = kTestTrack;
+  publisher.register_track(std::move(track));
+}
+
+moq::SubscribeRequest TestSubscribeRequest() {
+  moq::SubscribeRequest request;
+  request.track_namespace = kTestNamespace;
+  request.track_name = kTestTrack;
+  return request;
+}
+
+void StopSubscription(moq::MoqSubscriberSession &subscriber, const moq::SubscriptionHandle &handle) {
+  subscriber.stop_subscription(handle.request_id()).get();
+}
+
+long long ElapsedMilliseconds(Clock::time_point started) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
 }
 
 TestResult RunSetupOnly(const Options &options) {
   const auto started = Clock::now();
   TestResult result;
   try {
-    auto session = Connect(options);
+    auto session = ConnectSubscriber(options);
     session->close();
     result.passed = true;
   } catch (const std::exception &error) {
@@ -165,7 +213,45 @@ TestResult RunSetupOnly(const Options &options) {
     result.expected = "peer SETUP";
     result.received = "connection failure";
   }
-  result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
+  result.duration_ms = ElapsedMilliseconds(started);
+  return result;
+}
+
+TestResult RunAnnounceOnly(const Options &options) {
+  const auto started = Clock::now();
+  TestResult result;
+  try {
+    auto publisher = ConnectPublisher(options);
+    RegisterTestTrack(*publisher);
+    std::this_thread::sleep_for(kAnnouncementDelay);
+    publisher->close();
+    result.passed = true;
+  } catch (const std::exception &error) {
+    result.message = error.what();
+    result.expected = "REQUEST_OK for PUBLISH_NAMESPACE";
+    result.received = "connection or protocol failure";
+  }
+  result.duration_ms = ElapsedMilliseconds(started);
+  return result;
+}
+
+TestResult RunPublishNamespaceDone(const Options &options) {
+  const auto started = Clock::now();
+  TestResult result;
+  try {
+    auto publisher = ConnectPublisher(options);
+    RegisterTestTrack(*publisher);
+    std::this_thread::sleep_for(kAnnouncementDelay);
+    publisher->unregister_track(kTestNamespace, kTestTrack);
+    std::this_thread::sleep_for(kWithdrawalDelay);
+    publisher->close();
+    result.passed = true;
+  } catch (const std::exception &error) {
+    result.message = error.what();
+    result.expected = "PUBLISH_NAMESPACE followed by request stream cancellation";
+    result.received = "connection or protocol failure";
+  }
+  result.duration_ms = ElapsedMilliseconds(started);
   return result;
 }
 
@@ -173,20 +259,20 @@ TestResult RunSubscribeError(const Options &options) {
   const auto started = Clock::now();
   TestResult result;
   try {
-    auto session = Connect(options);
+    auto session = ConnectSubscriber(options);
     moq::SubscribeRequest request;
     request.track_namespace = {"nonexistent", "namespace"};
-    request.track_name = "test-track";
+    request.track_name = kTestTrack;
 
     auto subscribe = session->subscribe(std::move(request), std::make_shared<NullHandler>());
-    if (subscribe.wait_for(kTestTimeout) != std::future_status::ready) {
+    if (subscribe.wait_for(kSetupTimeout) != std::future_status::ready) {
       session->close();
       throw std::runtime_error("timeout waiting for REQUEST_ERROR");
     }
 
     try {
       const moq::SubscriptionHandle handle = subscribe.get();
-      session->stop_subscription(handle.request_id()).get();
+      StopSubscription(*session, handle);
       result.message = "relay accepted a subscription to a non-existent track";
       result.expected = "REQUEST_ERROR";
       result.received = "SUBSCRIBE_OK";
@@ -199,7 +285,73 @@ TestResult RunSubscribeError(const Options &options) {
     result.expected = "REQUEST_ERROR";
     result.received = "connection or protocol failure";
   }
-  result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
+  result.duration_ms = ElapsedMilliseconds(started);
+  return result;
+}
+
+TestResult RunAnnounceSubscribe(const Options &options) {
+  const auto started = Clock::now();
+  TestResult result;
+  try {
+    auto publisher = ConnectPublisher(options);
+    RegisterTestTrack(*publisher);
+    std::this_thread::sleep_for(kSubscriberStartDelay);
+
+    auto subscriber = ConnectSubscriber(options);
+    auto subscribe = subscriber->subscribe(TestSubscribeRequest(), std::make_shared<NullHandler>());
+    if (subscribe.wait_for(kSubscribeTimeout) != std::future_status::ready) {
+      throw std::runtime_error("timeout waiting for SUBSCRIBE_OK");
+    }
+    const moq::SubscriptionHandle handle = subscribe.get();
+    StopSubscription(*subscriber, handle);
+
+    subscriber->close();
+    publisher->close();
+    result.passed = true;
+  } catch (const moq::RequestRejected &error) {
+    result.message = error.what();
+    result.expected = "SUBSCRIBE_OK routed to publisher";
+    result.received = "REQUEST_ERROR";
+  } catch (const std::exception &error) {
+    result.message = error.what();
+    result.expected = "SUBSCRIBE_OK routed to publisher";
+    result.received = "connection or protocol failure";
+  }
+  result.duration_ms = ElapsedMilliseconds(started);
+  return result;
+}
+
+TestResult RunSubscribeBeforeAnnounce(const Options &options) {
+  const auto started = Clock::now();
+  TestResult result;
+  try {
+    auto subscriber = ConnectSubscriber(options);
+    auto subscribe = subscriber->subscribe(TestSubscribeRequest(), std::make_shared<NullHandler>());
+
+    std::this_thread::sleep_for(kPublisherStartDelay);
+    auto publisher = ConnectPublisher(options);
+    RegisterTestTrack(*publisher);
+    std::this_thread::sleep_for(kSubscriberStartDelay);
+
+    if (subscribe.wait_for(kSubscribeBeforeAnnounceTimeout) != std::future_status::ready) {
+      throw std::runtime_error("timeout waiting for SUBSCRIBE_OK or REQUEST_ERROR");
+    }
+    try {
+      const moq::SubscriptionHandle handle = subscribe.get();
+      StopSubscription(*subscriber, handle);
+    } catch (const moq::RequestRejected &) {
+      // Relays may reject rather than buffer a subscription made before an announcement.
+    }
+
+    subscriber->close();
+    publisher->close();
+    result.passed = true;
+  } catch (const std::exception &error) {
+    result.message = error.what();
+    result.expected = "SUBSCRIBE_OK or REQUEST_ERROR";
+    result.received = "timeout, connection, or protocol failure";
+  }
+  result.duration_ms = ElapsedMilliseconds(started);
   return result;
 }
 
@@ -207,10 +359,19 @@ TestResult RunTest(const std::string &name, const Options &options) {
   if (name == "setup-only") {
     return RunSetupOnly(options);
   }
+  if (name == "announce-only") {
+    return RunAnnounceOnly(options);
+  }
+  if (name == "publish-namespace-done") {
+    return RunPublishNamespaceDone(options);
+  }
   if (name == "subscribe-error") {
     return RunSubscribeError(options);
   }
-  return TestResult{true, true, "publisher role is not implemented by moqtopus", {}, {}, 0};
+  if (name == "announce-subscribe") {
+    return RunAnnounceSubscribe(options);
+  }
+  return RunSubscribeBeforeAnnounce(options);
 }
 
 std::string EscapeYaml(const std::string &value) {
@@ -226,11 +387,6 @@ std::string EscapeYaml(const std::string &value) {
 }
 
 void PrintResult(size_t number, const std::string &name, const TestResult &result) {
-  if (result.skipped) {
-    std::cout << "ok " << number << " - " << name << " # SKIP " << result.message << '\n';
-    return;
-  }
-
   std::cout << (result.passed ? "ok " : "not ok ") << number << " - " << name << '\n';
   std::cout << "  ---\n";
   std::cout << "  duration_ms: " << result.duration_ms << '\n';
@@ -260,6 +416,7 @@ bool IsKnownTest(const std::string &name) {
 int main(int argc, char **argv) {
   try {
     const Options options = ParseOptions(argc, argv);
+    spdlog::set_default_logger(spdlog::stderr_color_mt("moqtopus-interop"));
     spdlog::set_level(options.verbose ? spdlog::level::debug : spdlog::level::off);
 
     if (options.list) {
@@ -282,17 +439,12 @@ int main(int argc, char **argv) {
     std::cout << "1.." << tests.size() << '\n';
 
     bool failed = false;
-    bool unsupported = false;
     for (size_t index = 0; index < tests.size(); ++index) {
       const TestResult result = RunTest(tests[index], options);
       PrintResult(index + 1, tests[index], result);
-      failed = failed || (!result.passed && !result.skipped);
-      unsupported = unsupported || (options.testcase.has_value() && result.skipped);
+      failed = failed || !result.passed;
     }
-    if (failed) {
-      return kExitFailure;
-    }
-    return unsupported ? kExitUnsupported : kExitSuccess;
+    return failed ? kExitFailure : kExitSuccess;
   } catch (const std::exception &error) {
     std::cerr << "moqtopus interop client: " << error.what() << '\n';
     return kExitFailure;

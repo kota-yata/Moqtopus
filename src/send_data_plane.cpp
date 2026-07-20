@@ -64,6 +64,15 @@ const PublishedTrack *SendDataPlane::find_track(const TrackNamespace &track_name
   return entry == tracks_.end() ? nullptr : &entry->second.track;
 }
 
+bool SendDataPlane::has_track_in_namespace(const TrackNamespace &track_namespace) const {
+  for (const auto &entry : tracks_) {
+    if (entry.second.track.track_namespace == track_namespace) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::optional<RequestId> SendDataPlane::subscription_for_track(const TrackNamespace &track_namespace,
                                                                const TrackName &track_name) const {
   const auto entry = tracks_.find(make_track_key(track_namespace, track_name));

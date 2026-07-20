@@ -175,7 +175,10 @@ public:
   void unregister_track(const TrackNamespace &track_namespace, const TrackName &track_name) {
     const std::lock_guard<std::recursive_mutex> lock(mutex_);
     end_track_locked(track_namespace, track_name, PublishDoneCode::TrackEnded, "track unregistered");
-    send_plane_.unregister_track(track_namespace, track_name);
+    if (send_plane_.unregister_track(track_namespace, track_name) &&
+        !send_plane_.has_track_in_namespace(track_namespace)) {
+      withdraw_namespace(track_namespace);
+    }
   }
 
   void publish(PublishedObject object) {
@@ -196,6 +199,18 @@ public:
   void close(SessionCloseErrorCode error) {
     const std::lock_guard<std::recursive_mutex> lock(mutex_);
     begin_close(error, "local close");
+  }
+
+  void close_and_wait(SessionCloseErrorCode error) {
+    std::unique_ptr<MsQuicTransportAdapter> transport;
+    {
+      const std::lock_guard<std::recursive_mutex> lock(mutex_);
+      begin_close(error, "local close");
+      // Keep this impl alive while the adapter drains its callbacks. Destroying
+      // it from the final callback would close that callback's stream re-entrantly.
+      transport = std::move(transport_);
+    }
+    transport.reset();
   }
 
   // ---- called by the peer stream gate ----
@@ -335,6 +350,22 @@ private:
     } catch (const std::exception &error) {
       spdlog::warn("PUBLISH_NAMESPACE for \"{}\" failed: {}", name, error.what());
     }
+  }
+
+  void withdraw_namespace(const TrackNamespace &track_namespace) {
+    pending_announcements_.erase(
+        std::remove(pending_announcements_.begin(), pending_announcements_.end(), track_namespace),
+        pending_announcements_.end());
+
+    const std::string name = namespace_text(track_namespace);
+    const auto found = announced_namespaces_.find(name);
+    if (found == announced_namespaces_.end()) {
+      return;
+    }
+    found->second->abort_send(static_cast<uint64_t>(StreamResetCode::Cancelled));
+    found->second->abort_receive(static_cast<uint64_t>(StreamResetCode::Cancelled));
+    announced_namespaces_.erase(found);
+    spdlog::debug("PUBLISH_NAMESPACE withdrawn for \"{}\"", name);
   }
 
   RequestId allocate_local_request_id() {
@@ -654,7 +685,7 @@ void MoqPublisherSession::close(SessionCloseErrorCode error) { impl_->close(erro
 
 MoqPublisherSession::~MoqPublisherSession() {
   if (impl_) {
-    impl_->close(SessionCloseErrorCode::NoError);
+    impl_->close_and_wait(SessionCloseErrorCode::NoError);
   }
 }
 

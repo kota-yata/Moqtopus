@@ -49,6 +49,7 @@ public:
   bool register_track(PublishedTrack track);
   bool unregister_track(const TrackNamespace &track_namespace, const TrackName &track_name);
   const PublishedTrack *find_track(const TrackNamespace &track_namespace, const TrackName &track_name) const;
+  bool has_track_in_namespace(const TrackNamespace &track_namespace) const;
   std::optional<RequestId> subscription_for_track(const TrackNamespace &track_namespace,
                                                   const TrackName &track_name) const;
   std::optional<Location> largest_location(const TrackNamespace &track_namespace, const TrackName &track_name) const;

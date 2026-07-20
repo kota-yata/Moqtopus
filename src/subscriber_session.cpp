@@ -189,6 +189,15 @@ public:
 
   void close(SessionCloseErrorCode error) { begin_close(error, "local close"); }
 
+  void close_and_wait(SessionCloseErrorCode error) {
+    begin_close(error, "local close");
+    // Drain transport callbacks while the public session still owns this impl.
+    // Otherwise a callback can release the last shared_ptr and destroy its own
+    // StreamContext re-entrantly.
+    auto transport = std::move(transport_);
+    transport.reset();
+  }
+
   // ---- called by stream gates (cold path) ----
 
   DataPlane &data_plane() { return data_plane_; }
@@ -553,7 +562,7 @@ void MoqSubscriberSession::close(SessionCloseErrorCode error) { impl_->close(err
 
 MoqSubscriberSession::~MoqSubscriberSession() {
   if (impl_) {
-    impl_->close(SessionCloseErrorCode::NoError);
+    impl_->close_and_wait(SessionCloseErrorCode::NoError);
   }
 }
 
