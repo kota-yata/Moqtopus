@@ -3,7 +3,7 @@
 #include "data_plane.h"
 #include "moq/codec.h"
 #include "msquic_transport_adapter.h"
-#include "request/subscription.h"
+#include "request/subscriber_subscription.h"
 
 #include <algorithm>
 #include <exception>
