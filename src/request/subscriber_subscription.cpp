@@ -56,6 +56,7 @@ void SubscriptionFSM::fail_updates(std::exception_ptr error) {
   }
 }
 
+// report_error boolean is necessary because some callers want to report an error by itself
 void SubscriptionFSM::terminate(bool report_error, std::string reason) {
   if (phase_ == moq::SubscriptionPhase::Terminated)
     return;

@@ -59,6 +59,10 @@ enum class StreamResetCode : uint64_t {
   SessionClosed = 0x3,
   GoingAway = 0x4,
   TooFarBehind = 0x5,
+  UNKNOWN_OBJECT_STATUS = 0x6,
+  EXPIRED_AUTH_TOKEN = 0x7,
+  EXCESSIVE_LOAD = 0x9,
+  MALFORMED_TRACK = 0x12,
 };
 
 struct ReceiveError {

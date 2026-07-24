@@ -51,7 +51,10 @@ public:
       : msquic_config_(std::move(msquic_config)), subscriber_config_(std::move(subscriber_config)),
         data_plane_(
             subscriber_config_, [this](std::string error) { protocol_violation(std::move(error)); },
-            [this](RequestId request_id, std::string error) { malformed_track(request_id, std::move(error)); }) {
+            [this](RequestId request_id, std::string error) {
+              stop_subscription_now(request_id, true, std::move(error),
+                                    static_cast<uint64_t>(StreamResetCode::MALFORMED_TRACK));
+            }) {
     refresh_session_snapshot();
   }
 
@@ -285,15 +288,19 @@ private:
     return request_id;
   }
 
-  void stop_subscription_now(RequestId request_id, bool report_error) {
+  // Stops the subscription corresponding to request_id immediately.
+  // Unless specified, it sends STOP_SENDING with error code 0 (Internal Error)
+  void stop_subscription_now(RequestId request_id, bool report_error, std::string reason = std::string{},
+                             uint64_t stream_error_code = 0) {
     const auto found = subscriptions_.find(request_id);
     if (found == subscriptions_.end()) {
+      spdlog::debug("stop_subscription_now: no subscription found for request_id={}", request_id);
       return;
     }
     auto fsm = found->second;
-    fsm->terminate(report_error, report_error ? "subscription stopped after receive error" : std::string{});
+    fsm->terminate(report_error, report_error ? reason : std::string{});
     if (auto stream = fsm->stream()) {
-      stream->abort_receive(0);
+      stream->abort_receive(stream_error_code);
     }
     update_subscription_snapshot_from_fsm(request_id);
     refresh_session_snapshot();
@@ -301,12 +308,8 @@ private:
   }
 
   void malformed_track(RequestId request_id, std::string error) {
-    const auto found = subscriptions_.find(request_id);
-    if (found == subscriptions_.end()) {
-      return;
-    }
-    found->second->report_handler_error(ReceiveError{static_cast<uint64_t>(RequestErrorCode::MalformedTrack), error});
-    stop_subscription_now(request_id, false);
+    spdlog::debug("malformed track for request_id={}: {}", request_id, error);
+    stop_subscription_now(request_id, true, "malformed track", static_cast<uint64_t>(StreamResetCode::MALFORMED_TRACK));
   }
 
   void begin_close(SessionCloseErrorCode code, std::string reason) {
