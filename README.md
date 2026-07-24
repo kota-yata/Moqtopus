@@ -2,7 +2,7 @@
 MoQ Client API over MsQUIC. Moqtopus keeps the dependency graph small, which helps a lot when the rest of your application already take a gazillion year building (like UE).
 
 ## Draft Compatibility
-Moqtopus was compliant with 4 relays at [IETF126](https://github.com/moq-wg/moq-transport/wiki/ad-hoc-interop-reports#2026-07-ietf-126-vienna) (draft-18). See [moq-interop-runner](https://englishm.github.io/moq-interop-runner/) for the latest interop result.
+Moqtopus was compliant with draft-18, and interopped with 4 relays at [IETF126](https://github.com/moq-wg/moq-transport/wiki/ad-hoc-interop-reports#2026-07-ietf-126-vienna). See [moq-interop-runner](https://englishm.github.io/moq-interop-runner/) for the latest interop result.
 
 ## Build
 Moqtopus requires [vcpkg](https://github.com/microsoft/vcpkg). Set
