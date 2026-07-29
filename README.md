@@ -47,3 +47,6 @@ Example:
 ```sh
 ./build/subscriber localhost 4433 camera/front video / moqt-18
 ```
+
+## Subscriber flow
+![sub](./static/data-flow-new.svg)

@@ -194,9 +194,7 @@ SubscriptionDecision SendDataPlane::update_subscription(RequestId request_id,
   return SubscriptionDecision::accept();
 }
 
-uint64_t SendDataPlane::finish_subscription(RequestId request_id) {
-  return detach_subscription(request_id, false, 0);
-}
+uint64_t SendDataPlane::finish_subscription(RequestId request_id) { return detach_subscription(request_id, false, 0); }
 
 uint64_t SendDataPlane::reset_subscription(RequestId request_id, uint64_t reset_error_code) {
   return detach_subscription(request_id, true, reset_error_code);
@@ -315,8 +313,8 @@ void SendDataPlane::send_on_subgroup_stream(SubscriptionSend &subscription, cons
   codec::encode_subgroup_object(bytes, delta, properties, object.status, BytesView{object.payload});
   open.last_object_id = object.object_id;
 
-  bool close_stream = object.end_of_subgroup || object.end_of_group ||
-                      (object.status && *object.status != codec::kObjectStatusNormal);
+  bool close_stream =
+      object.end_of_subgroup || object.end_of_group || (object.status && *object.status != codec::kObjectStatusNormal);
   if (object.end_of_group && (!object.status || *object.status == codec::kObjectStatusNormal)) {
     // Explicit EndOfGroup marker (at Object ID + 1) so the subscriber learns
     // the final Object ID; the plain FIN would only close the subgroup.
@@ -341,10 +339,9 @@ void SendDataPlane::send_datagram_object(const SubscriptionSend &subscription, c
   if (status && *status != codec::kObjectStatusNormal && !properties.empty()) {
     properties = BytesView{};
   }
-  ByteBuffer bytes =
-      codec::encode_object_datagram(subscription.track_alias, object.group_id, object.object_id,
-                                    object.publisher_priority, properties, status, BytesView{object.payload},
-                                    object.end_of_group);
+  ByteBuffer bytes = codec::encode_object_datagram(subscription.track_alias, object.group_id, object.object_id,
+                                                   object.publisher_priority, properties, status,
+                                                   BytesView{object.payload}, object.end_of_group);
   if (!callbacks_.send_datagram(std::move(bytes))) {
     // Oversized or unsupported datagrams are dropped without notification (Section 11.3).
     SPDLOG_TRACE("datagram for request {} dropped", subscription.request_id);
